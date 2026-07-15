@@ -1,0 +1,24 @@
+services:
+  gateway:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/gateway.db
+      FORCE_PRIMARY_FAIL: ${FORCE_PRIMARY_FAIL:-0}
+    ports:
+      - "8000:8000"
+    volumes:
+      - gateway-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  gateway-data:
