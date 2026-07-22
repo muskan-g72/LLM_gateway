@@ -4,10 +4,11 @@ import json
 import re
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Annotated, TypeAlias, cast
+from typing import Annotated, Literal, TypeAlias, cast
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
 from app.skills import SkillDefinition
 
@@ -35,6 +36,10 @@ class OutputSemanticError(OutputValidationError):
 
 class UnsupportedSkillOutputError(OutputValidationError):
     """No concrete runtime output model is registered for the skill."""
+
+
+class ModelResponseProtocolError(OutputValidationError):
+    """A typed final/tool-call envelope violates the bounded response protocol."""
 
 
 def _require_non_blank(value: str) -> str:
@@ -65,6 +70,35 @@ class ExtractActionItemsOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     action_items: list[ActionItem]
+
+
+class FinalResponseEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    type: Literal["final"]
+    output: dict[str, object]
+
+
+class ToolCallPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    arguments: dict[str, object]
+
+
+class ToolCallEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    type: Literal["tool_call"]
+    tool_call: ToolCallPayload
+
+
+@dataclass(frozen=True)
+class FinalResponseCandidate:
+    output: dict[str, object]
+
+
+ModelResponseCandidate: TypeAlias = FinalResponseCandidate | ToolCallPayload
 
 
 ValidatedOutput: TypeAlias = SummarizeOutput | ExtractActionItemsOutput
@@ -180,6 +214,47 @@ def _pydantic_issues(error: ValidationError) -> tuple[str, ...]:
     return tuple(issues)
 
 
+class ModelResponseEnvelopeParser:
+    """Parse only exact JSON final/tool-call envelopes, with legacy final support."""
+
+    def parse(self, raw_output: str) -> ModelResponseCandidate:
+        parsed = _parse_json_document(raw_output)
+        if type(parsed) is not dict:
+            raise OutputStructureError(
+                "model output has an invalid root",
+                ("$: expected JSON object",),
+            )
+
+        response_type = parsed.get("type")
+        if response_type is None:
+            return FinalResponseCandidate(output=parsed)
+
+        model: type[BaseModel]
+        if response_type == "final":
+            model = FinalResponseEnvelope
+        elif response_type == "tool_call":
+            model = ToolCallEnvelope
+        else:
+            raise ModelResponseProtocolError(
+                "model response mode is invalid",
+                ("type: expected final or tool_call",),
+            )
+
+        try:
+            envelope = model.model_validate(parsed)
+        except ValidationError as error:
+            raise ModelResponseProtocolError(
+                "model response envelope is invalid",
+                _pydantic_issues(error),
+            ) from None
+
+        if isinstance(envelope, FinalResponseEnvelope):
+            return FinalResponseCandidate(output=envelope.output)
+        if isinstance(envelope, ToolCallEnvelope):
+            return envelope.tool_call
+        raise RuntimeError("model response envelope registry is inconsistent")
+
+
 def _source_text(task_input: dict[str, object]) -> str:
     source = task_input.get("text")
     if type(source) is not str or not source.strip():
@@ -269,18 +344,26 @@ class OutputValidator:
         task_input: dict[str, object],
         raw_output: str,
     ) -> ValidatedOutput:
-        output_model = OUTPUT_MODEL_REGISTRY.get(skill.name)
-        semantic_validator = _SEMANTIC_VALIDATOR_REGISTRY.get(skill.name)
-        if output_model is None or semantic_validator is None:
-            raise UnsupportedSkillOutputError(
-                f"No output validator is registered for skill '{skill.name}'"
-            )
-
         parsed = _parse_json_document(raw_output)
         if type(parsed) is not dict:
             raise OutputStructureError(
                 "model output has an invalid root",
                 ("$: expected JSON object",),
+            )
+
+        return self.validate_value(skill, task_input, parsed)
+
+    def validate_value(
+        self,
+        skill: SkillDefinition,
+        task_input: dict[str, object],
+        parsed: dict[str, object],
+    ) -> ValidatedOutput:
+        output_model = OUTPUT_MODEL_REGISTRY.get(skill.name)
+        semantic_validator = _SEMANTIC_VALIDATOR_REGISTRY.get(skill.name)
+        if output_model is None or semantic_validator is None:
+            raise UnsupportedSkillOutputError(
+                f"No output validator is registered for skill '{skill.name}'"
             )
 
         try:

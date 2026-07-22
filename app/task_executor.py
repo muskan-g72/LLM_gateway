@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from dataclasses import dataclass, field
+from time import perf_counter
 from uuid import UUID, uuid4
 
 from app.output_validation import (
+    FinalResponseCandidate,
+    ModelResponseEnvelopeParser,
+    ModelResponseProtocolError,
     OutputParsingError,
     OutputSemanticError,
     OutputStructureError,
@@ -13,8 +17,9 @@ from app.output_validation import (
     OutputValidator,
     UnsupportedSkillOutputError,
     ValidatedOutput,
+    ToolCallPayload,
 )
-from app.prompt_builder import PromptBuilder
+from app.prompt_builder import PromptBuildError, PromptBuilder
 from app.providers import (
     ProviderCompletion,
     ProviderConfigurationError,
@@ -22,9 +27,19 @@ from app.providers import (
     ProviderGateway,
 )
 from app.skills import SkillDefinition, SkillLoader
+from app.tools import (
+    RepeatedToolCallError,
+    ToolError,
+    ToolExecutionResult,
+    ToolNotAllowedError,
+    ToolProtocolError,
+    ToolRegistry,
+    build_builtin_tool_registry,
+)
 from app.tracing import (
-    AttemptRecorder,
     AttemptType,
+    ExecutionRecorder,
+    ToolTraceStatus,
     ExecutionAttempt,
     ValidationErrorCategory,
 )
@@ -33,6 +48,7 @@ from app.tracing import (
 INVALID_OUTPUT_EXCERPT_LIMIT = 2_000
 REPAIR_ISSUE_LIMIT = 10
 REPAIR_ISSUE_CHARACTER_LIMIT = 200
+MAX_PROVIDER_CALLS = 4
 
 
 @dataclass(frozen=True)
@@ -114,6 +130,19 @@ class TaskTraceRecordingError(TaskExecutionError):
     """Execution stopped because safe attempt metadata could not be persisted."""
 
 
+class TaskToolExecutionError(TaskExecutionError):
+    """A safe bounded tool policy, validation, execution, or result failure."""
+
+    def __init__(
+        self,
+        tool_error: ToolError,
+        attempts: int,
+        completion_usage: tuple[CompletionUsage, ...],
+    ) -> None:
+        self.category = tool_error.category
+        super().__init__("bounded tool execution failed", attempts, completion_usage)
+
+
 @dataclass(frozen=True)
 class _Invocation:
     attempt_number: int
@@ -126,7 +155,7 @@ class _Invocation:
 class _ExecutionState:
     attempts: int = 0
     completion_usage: list[CompletionUsage] = field(default_factory=list)
-    recorder: AttemptRecorder | None = None
+    recorder: ExecutionRecorder | None = None
 
     def _record(self, attempt: ExecutionAttempt) -> None:
         if self.recorder is None:
@@ -147,6 +176,12 @@ class _ExecutionState:
         messages: list[dict[str, str]],
         attempt_type: AttemptType,
     ) -> _Invocation:
+        if self.attempts >= MAX_PROVIDER_CALLS:
+            raise TaskProvidersUnavailableError(
+                "provider call limit reached",
+                self.attempts,
+                self.frozen_usage(),
+            )
         self.attempts += 1
         try:
             completion = provider_gateway.complete_with_provider(
@@ -214,6 +249,41 @@ class _ExecutionState:
 
     def frozen_usage(self) -> tuple[CompletionUsage, ...]:
         return tuple(self.completion_usage)
+
+    def start_tool(self, tool_number: int, tool_name: str) -> None:
+        if self.recorder is None:
+            return
+        try:
+            self.recorder.start_tool(tool_number, tool_name)
+        except Exception:
+            raise TaskTraceRecordingError(
+                "tool execution metadata could not be recorded",
+                self.attempts,
+                self.frozen_usage(),
+            ) from None
+
+    def finish_tool(
+        self,
+        tool_number: int,
+        status: ToolTraceStatus,
+        error_category: str | None,
+        duration_ms: int,
+    ) -> None:
+        if self.recorder is None:
+            return
+        try:
+            self.recorder.finish_tool(
+                tool_number,
+                status,
+                error_category,
+                duration_ms,
+            )
+        except Exception:
+            raise TaskTraceRecordingError(
+                "tool execution metadata could not be finalized",
+                self.attempts,
+                self.frozen_usage(),
+            ) from None
 
 
 def _bounded_repair_issues(error: OutputValidationError) -> tuple[str, ...]:
@@ -307,11 +377,14 @@ class TaskExecutor:
         prompt_builder: PromptBuilder,
         provider_gateway: ProviderGateway,
         output_validator: OutputValidator,
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         self.skill_loader = skill_loader
         self.prompt_builder = prompt_builder
         self.provider_gateway = provider_gateway
         self.output_validator = output_validator
+        self.tool_registry = tool_registry or build_builtin_tool_registry()
+        self.envelope_parser = ModelResponseEnvelopeParser()
 
     def prepare(
         self,
@@ -328,7 +401,13 @@ class TaskExecutor:
         task_input: dict[str, object],
         preferences: dict[str, object] | None = None,
     ) -> PreparedTask:
-        messages = self.prompt_builder.build(skill, task_input, preferences)
+        tool_metadata = self.tool_registry.metadata_for(skill.allowed_tools)
+        messages = self.prompt_builder.build(
+            skill,
+            task_input,
+            preferences,
+            tool_metadata,
+        )
         return PreparedTask(
             task_id=uuid4(),
             skill=skill,
@@ -339,7 +418,7 @@ class TaskExecutor:
     def execute(
         self,
         prepared: PreparedTask,
-        recorder: AttemptRecorder | None = None,
+        recorder: ExecutionRecorder | None = None,
     ) -> TaskExecutionResult:
         state = _ExecutionState(recorder=recorder)
         initial_messages = [dict(message) for message in prepared.messages]
@@ -357,53 +436,79 @@ class TaskExecutor:
             return self._execute_fallback(prepared, state)
 
         try:
-            result = self._validate_candidate(prepared, state, primary_invocation)
+            candidate = self._validate_candidate(
+                prepared,
+                state,
+                primary_invocation,
+                allow_tool_call=True,
+            )
         except UnsupportedSkillOutputError:
             raise self._internal_error(state) from None
         except OutputValidationError as validation_error:
-            if prepared.skill.maximum_repair_attempts == 0:
-                raise self._invalid_output_error(state, validation_error) from None
-
-            repair_messages = _build_repair_messages(
-                prepared.messages,
-                prepared.skill,
-                validation_error,
-                primary_invocation.completion.content,
-            )
-            try:
-                repaired_invocation = state.invoke(
-                    self.provider_gateway,
-                    ProviderGateway.PRIMARY_PROVIDER,
-                    repair_messages,
-                    "repair",
-                )
-            except ProviderConfigurationError:
-                raise self._configuration_error(state) from None
-            except ProviderError:
-                return self._execute_fallback(prepared, state)
-
-            try:
-                repaired_result = self._validate_candidate(
-                    prepared,
-                    state,
-                    repaired_invocation,
-                )
-            except UnsupportedSkillOutputError:
-                raise self._internal_error(state) from None
-            except OutputValidationError as repaired_error:
-                raise self._invalid_output_error(state, repaired_error) from None
-            return self._success(
+            return self._repair_primary_initial(
                 prepared,
                 state,
-                repaired_invocation.completion,
-                repaired_result,
+                primary_invocation,
+                validation_error,
             )
 
+        if isinstance(candidate, ToolCallPayload):
+            return self._execute_tool_request(
+                prepared,
+                state,
+                candidate,
+                primary_invocation.provider,
+            )
         return self._success(
             prepared,
             state,
             primary_invocation.completion,
-            result,
+            candidate,
+        )
+
+    def _repair_primary_initial(
+        self,
+        prepared: PreparedTask,
+        state: _ExecutionState,
+        invalid_invocation: _Invocation,
+        validation_error: OutputValidationError,
+    ) -> TaskExecutionResult:
+        if prepared.skill.maximum_repair_attempts == 0:
+            raise self._invalid_output_error(state, validation_error) from None
+        repair_messages = _build_repair_messages(
+            prepared.messages,
+            prepared.skill,
+            validation_error,
+            invalid_invocation.completion.content,
+        )
+        try:
+            repaired_invocation = state.invoke(
+                self.provider_gateway,
+                ProviderGateway.PRIMARY_PROVIDER,
+                repair_messages,
+                "repair",
+            )
+        except ProviderConfigurationError:
+            raise self._configuration_error(state) from None
+        except ProviderError:
+            return self._execute_fallback(prepared, state)
+
+        try:
+            repaired_result = self._validate_candidate(
+                prepared,
+                state,
+                repaired_invocation,
+                allow_tool_call=False,
+            )
+        except UnsupportedSkillOutputError:
+            raise self._internal_error(state) from None
+        except OutputValidationError as repaired_error:
+            raise self._invalid_output_error(state, repaired_error) from None
+        return self._success(
+            prepared,
+            state,
+            repaired_invocation.completion,
+            self._require_final(repaired_result, state),
         )
 
     def _execute_fallback(
@@ -425,36 +530,271 @@ class TaskExecutor:
             raise self._unavailable_error(state) from None
 
         try:
-            result = self._validate_candidate(prepared, state, fallback_invocation)
+            candidate = self._validate_candidate(
+                prepared,
+                state,
+                fallback_invocation,
+                allow_tool_call=True,
+            )
         except UnsupportedSkillOutputError:
             raise self._internal_error(state) from None
         except OutputValidationError as validation_error:
-            if prepared.skill.maximum_repair_attempts == 0:
-                raise self._invalid_output_error(state, validation_error) from None
+            return self._repair_fallback_initial(
+                prepared,
+                state,
+                fallback_invocation,
+                validation_error,
+            )
 
-            repair_messages = _build_repair_messages(
+        if isinstance(candidate, ToolCallPayload):
+            return self._execute_tool_request(
+                prepared,
+                state,
+                candidate,
+                fallback_invocation.provider,
+            )
+        return self._success(
+            prepared,
+            state,
+            fallback_invocation.completion,
+            candidate,
+        )
+
+    def _repair_fallback_initial(
+        self,
+        prepared: PreparedTask,
+        state: _ExecutionState,
+        invalid_invocation: _Invocation,
+        validation_error: OutputValidationError,
+    ) -> TaskExecutionResult:
+        if prepared.skill.maximum_repair_attempts == 0:
+            raise self._invalid_output_error(state, validation_error) from None
+        repair_messages = _build_repair_messages(
+            prepared.messages,
+            prepared.skill,
+            validation_error,
+            invalid_invocation.completion.content,
+        )
+        try:
+            repaired_invocation = state.invoke(
+                self.provider_gateway,
+                ProviderGateway.FALLBACK_PROVIDER,
+                repair_messages,
+                "fallback_repair",
+            )
+        except ProviderConfigurationError:
+            raise self._configuration_error(state) from None
+        except ProviderError:
+            raise self._unavailable_error(state) from None
+
+        try:
+            repaired_result = self._validate_candidate(
+                prepared,
+                state,
+                repaired_invocation,
+                allow_tool_call=False,
+            )
+        except UnsupportedSkillOutputError:
+            raise self._internal_error(state) from None
+        except OutputValidationError as repaired_error:
+            raise self._invalid_output_error(state, repaired_error) from None
+        return self._success(
+            prepared,
+            state,
+            repaired_invocation.completion,
+            self._require_final(repaired_result, state),
+        )
+
+    def _execute_tool_request(
+        self,
+        prepared: PreparedTask,
+        state: _ExecutionState,
+        request: ToolCallPayload,
+        provider_name: str,
+    ) -> TaskExecutionResult:
+        try:
+            tool = self.tool_registry.get(request.name)
+            if request.name not in prepared.skill.allowed_tools:
+                raise ToolNotAllowedError()
+            validated_arguments = tool.validate_arguments(request.arguments)
+        except ToolError as error:
+            raise self._tool_error(state, error) from None
+
+        tool_number = 1
+        state.start_tool(tool_number, tool.definition.name)
+        started = perf_counter()
+        try:
+            tool_result = tool.execute_validated(validated_arguments)
+        except ToolError as error:
+            duration_ms = max(int((perf_counter() - started) * 1_000), 0)
+            state.finish_tool(tool_number, "failed", error.category, duration_ms)
+            raise self._tool_error(state, error) from None
+
+        duration_ms = max(int((perf_counter() - started) * 1_000), 0)
+        state.finish_tool(tool_number, "completed", None, duration_ms)
+        try:
+            post_tool_messages = self.prompt_builder.build_post_tool(
                 prepared.messages,
+                tool.definition.name,
+                tool_result.as_json_value(),
+            )
+        except PromptBuildError:
+            raise self._internal_error(state) from None
+        return self._execute_post_tool(
+            prepared,
+            state,
+            tuple(post_tool_messages),
+            provider_name,
+        )
+
+    def _execute_post_tool(
+        self,
+        prepared: PreparedTask,
+        state: _ExecutionState,
+        messages: tuple[dict[str, str], ...],
+        provider_name: str,
+    ) -> TaskExecutionResult:
+        try:
+            invocation = state.invoke(
+                self.provider_gateway,
+                provider_name,
+                [dict(message) for message in messages],
+                "post_tool",
+            )
+        except ProviderConfigurationError:
+            raise self._configuration_error(state) from None
+        except ProviderError:
+            if provider_name == ProviderGateway.PRIMARY_PROVIDER and self._can_call(state):
+                return self._execute_post_tool_fallback(prepared, state, messages)
+            raise self._unavailable_error(state) from None
+
+        try:
+            candidate = self._validate_candidate(
+                prepared,
+                state,
+                invocation,
+                allow_tool_call=False,
+            )
+        except UnsupportedSkillOutputError:
+            raise self._internal_error(state) from None
+        except OutputValidationError as validation_error:
+            return self._repair_post_tool(
+                prepared,
+                state,
+                messages,
+                invocation,
+                validation_error,
+                provider_name,
+            )
+        return self._success(
+            prepared,
+            state,
+            invocation.completion,
+            self._require_final(candidate, state),
+        )
+
+    def _repair_post_tool(
+        self,
+        prepared: PreparedTask,
+        state: _ExecutionState,
+        messages: tuple[dict[str, str], ...],
+        invalid_invocation: _Invocation,
+        validation_error: OutputValidationError,
+        provider_name: str,
+    ) -> TaskExecutionResult:
+        if prepared.skill.maximum_repair_attempts == 0 or not self._can_call(state):
+            raise self._invalid_output_error(state, validation_error) from None
+        repair_messages = _build_repair_messages(
+            messages,
+            prepared.skill,
+            validation_error,
+            invalid_invocation.completion.content,
+        )
+        try:
+            repaired_invocation = state.invoke(
+                self.provider_gateway,
+                provider_name,
+                repair_messages,
+                "post_tool_repair",
+            )
+        except ProviderConfigurationError:
+            raise self._configuration_error(state) from None
+        except ProviderError:
+            if provider_name == ProviderGateway.PRIMARY_PROVIDER and self._can_call(state):
+                return self._execute_post_tool_fallback(prepared, state, messages)
+            raise self._unavailable_error(state) from None
+
+        try:
+            repaired_candidate = self._validate_candidate(
+                prepared,
+                state,
+                repaired_invocation,
+                allow_tool_call=False,
+            )
+        except UnsupportedSkillOutputError:
+            raise self._internal_error(state) from None
+        except OutputValidationError as repaired_error:
+            raise self._invalid_output_error(state, repaired_error) from None
+        return self._success(
+            prepared,
+            state,
+            repaired_invocation.completion,
+            self._require_final(repaired_candidate, state),
+        )
+
+    def _execute_post_tool_fallback(
+        self,
+        prepared: PreparedTask,
+        state: _ExecutionState,
+        messages: tuple[dict[str, str], ...],
+    ) -> TaskExecutionResult:
+        try:
+            invocation = state.invoke(
+                self.provider_gateway,
+                ProviderGateway.FALLBACK_PROVIDER,
+                [dict(message) for message in messages],
+                "post_tool_fallback",
+            )
+        except ProviderConfigurationError:
+            raise self._configuration_error(state) from None
+        except ProviderError:
+            raise self._unavailable_error(state) from None
+
+        try:
+            candidate = self._validate_candidate(
+                prepared,
+                state,
+                invocation,
+                allow_tool_call=False,
+            )
+        except UnsupportedSkillOutputError:
+            raise self._internal_error(state) from None
+        except OutputValidationError as validation_error:
+            if prepared.skill.maximum_repair_attempts == 0 or not self._can_call(state):
+                raise self._invalid_output_error(state, validation_error) from None
+            repair_messages = _build_repair_messages(
+                messages,
                 prepared.skill,
                 validation_error,
-                fallback_invocation.completion.content,
+                invocation.completion.content,
             )
             try:
                 repaired_invocation = state.invoke(
                     self.provider_gateway,
                     ProviderGateway.FALLBACK_PROVIDER,
                     repair_messages,
-                    "fallback_repair",
+                    "post_tool_fallback_repair",
                 )
             except ProviderConfigurationError:
                 raise self._configuration_error(state) from None
             except ProviderError:
                 raise self._unavailable_error(state) from None
-
             try:
-                repaired_result = self._validate_candidate(
+                repaired_candidate = self._validate_candidate(
                     prepared,
                     state,
                     repaired_invocation,
+                    allow_tool_call=False,
                 )
             except UnsupportedSkillOutputError:
                 raise self._internal_error(state) from None
@@ -464,14 +804,14 @@ class TaskExecutor:
                 prepared,
                 state,
                 repaired_invocation.completion,
-                repaired_result,
+                self._require_final(repaired_candidate, state),
             )
 
         return self._success(
             prepared,
             state,
-            fallback_invocation.completion,
-            result,
+            invocation.completion,
+            self._require_final(candidate, state),
         )
 
     def _validate_candidate(
@@ -479,34 +819,65 @@ class TaskExecutor:
         prepared: PreparedTask,
         state: _ExecutionState,
         invocation: _Invocation,
-    ) -> ValidatedOutput:
+        *,
+        allow_tool_call: bool,
+    ) -> ValidatedOutput | ToolCallPayload:
         try:
-            result = self.output_validator.validate(
+            candidate = self.envelope_parser.parse(invocation.completion.content)
+        except ModelResponseProtocolError:
+            state.record_completed(invocation, "tool_protocol")
+            raise self._tool_error(state, ToolProtocolError()) from None
+        except OutputValidationError as error:
+            state.record_completed(invocation, self._validation_category(error))
+            raise
+
+        if isinstance(candidate, ToolCallPayload):
+            state.record_completed(invocation)
+            if not allow_tool_call:
+                raise self._tool_error(state, RepeatedToolCallError()) from None
+            return candidate
+
+        if not isinstance(candidate, FinalResponseCandidate):
+            raise self._internal_error(state)
+        try:
+            result = self.output_validator.validate_value(
                 prepared.skill,
                 prepared.task_input,
-                invocation.completion.content,
+                candidate.output,
             )
         except OutputValidationError as error:
             category = self._validation_category(error)
-            if category is not None:
-                state.record_completed(invocation, category)
-            else:
-                state.record_completed(invocation)
+            state.record_completed(invocation, category)
             raise
         state.record_completed(invocation)
         return result
 
     @staticmethod
-    def _validation_category(
-        error: OutputValidationError,
-    ) -> ValidationErrorCategory | None:
+    def _require_final(
+        candidate: ValidatedOutput | ToolCallPayload,
+        state: _ExecutionState,
+    ) -> ValidatedOutput:
+        if isinstance(candidate, ToolCallPayload):
+            raise TaskToolExecutionError(
+                RepeatedToolCallError(),
+                state.attempts,
+                state.frozen_usage(),
+            )
+        return candidate
+
+    @staticmethod
+    def _can_call(state: _ExecutionState) -> bool:
+        return state.attempts < MAX_PROVIDER_CALLS
+
+    @staticmethod
+    def _validation_category(error: OutputValidationError) -> ValidationErrorCategory:
         if isinstance(error, OutputParsingError):
             return "parsing"
         if isinstance(error, OutputStructureError):
             return "structure"
         if isinstance(error, OutputSemanticError):
             return "semantic"
-        return None
+        return "structure"
 
     @staticmethod
     def _success(
@@ -556,6 +927,14 @@ class TaskExecutor:
             state.attempts,
             state.frozen_usage(),
             _bounded_repair_issues(error),
+        )
+
+    @staticmethod
+    def _tool_error(state: _ExecutionState, error: ToolError) -> TaskToolExecutionError:
+        return TaskToolExecutionError(
+            error,
+            state.attempts,
+            state.frozen_usage(),
         )
 
     @staticmethod

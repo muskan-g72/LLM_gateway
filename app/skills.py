@@ -19,6 +19,10 @@ from pydantic import (
 
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+ToolName = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$"),
+]
 
 
 class SkillError(Exception):
@@ -77,6 +81,13 @@ class SkillDefinition(BaseModel):
     output_schema: ObjectSchema
     validation_rules: list[NonEmptyText] = Field(min_length=1)
     maximum_repair_attempts: int = Field(ge=0, le=1)
+    allowed_tools: list[ToolName] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def allowed_tool_names_must_be_unique(self) -> "SkillDefinition":
+        if len(self.allowed_tools) != len(set(self.allowed_tools)):
+            raise ValueError("allowed_tools must not contain duplicates")
+        return self
 
 
 DEFAULT_SKILL_PATHS: Mapping[str, Path] = MappingProxyType(

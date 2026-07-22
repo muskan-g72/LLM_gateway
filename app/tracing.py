@@ -4,16 +4,31 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 
-AttemptType = Literal["initial", "repair", "fallback", "fallback_repair"]
+AttemptType = Literal[
+    "initial",
+    "repair",
+    "fallback",
+    "fallback_repair",
+    "post_tool",
+    "post_tool_repair",
+    "post_tool_fallback",
+    "post_tool_fallback_repair",
+]
 AttemptStatus = Literal[
     "completed",
     "validation_error",
     "operational_error",
     "configuration_error",
 ]
-ValidationErrorCategory = Literal["parsing", "structure", "semantic"]
+ValidationErrorCategory = Literal[
+    "parsing",
+    "structure",
+    "semantic",
+    "tool_protocol",
+]
 ProviderErrorCategory = Literal["operational", "configuration"]
 TraceStatus = Literal["running", "completed", "failed"]
+ToolTraceStatus = Literal["running", "completed", "failed"]
 
 
 @dataclass(frozen=True)
@@ -44,6 +59,17 @@ class StoredAttempt:
 
 
 @dataclass(frozen=True)
+class StoredToolExecution:
+    tool_number: int
+    tool_name: str
+    status: ToolTraceStatus
+    error_category: str | None
+    duration_ms: int
+    created_at: str
+    completed_at: str | None
+
+
+@dataclass(frozen=True)
 class StoredTaskTrace:
     task_id: str
     status: TraceStatus
@@ -56,6 +82,7 @@ class StoredTaskTrace:
     created_at: str
     completed_at: str | None
     attempt_history: tuple[StoredAttempt, ...]
+    tool_history: tuple[StoredToolExecution, ...]
 
 
 class AttemptRecorder(Protocol):
@@ -64,8 +91,36 @@ class AttemptRecorder(Protocol):
     def record(self, attempt: ExecutionAttempt) -> None: ...
 
 
+class ExecutionRecorder(AttemptRecorder, Protocol):
+    def start_tool(self, tool_number: int, tool_name: str) -> None: ...
+
+    def finish_tool(
+        self,
+        tool_number: int,
+        status: Literal["completed", "failed"],
+        error_category: str | None,
+        duration_ms: int,
+    ) -> None: ...
+
+
 class AttemptRepository(Protocol):
     def append_task_attempt(self, task_id: str, attempt: ExecutionAttempt) -> None: ...
+
+    def create_task_tool_execution(
+        self,
+        task_id: str,
+        tool_number: int,
+        tool_name: str,
+    ) -> None: ...
+
+    def finalize_task_tool_execution(
+        self,
+        task_id: str,
+        tool_number: int,
+        status: Literal["completed", "failed"],
+        error_category: str | None,
+        duration_ms: int,
+    ) -> None: ...
 
 
 class StoreTraceRecorder:
@@ -77,3 +132,25 @@ class StoreTraceRecorder:
 
     def record(self, attempt: ExecutionAttempt) -> None:
         self._repository.append_task_attempt(self._task_id, attempt)
+
+    def start_tool(self, tool_number: int, tool_name: str) -> None:
+        self._repository.create_task_tool_execution(
+            self._task_id,
+            tool_number,
+            tool_name,
+        )
+
+    def finish_tool(
+        self,
+        tool_number: int,
+        status: Literal["completed", "failed"],
+        error_category: str | None,
+        duration_ms: int,
+    ) -> None:
+        self._repository.finalize_task_tool_execution(
+            self._task_id,
+            tool_number,
+            status,
+            error_category,
+            duration_ms,
+        )

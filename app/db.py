@@ -14,6 +14,8 @@ from app.tracing import (
     ProviderErrorCategory,
     StoredAttempt,
     StoredTaskTrace,
+    StoredToolExecution,
+    ToolTraceStatus,
     TraceStatus,
     ValidationErrorCategory,
 )
@@ -122,7 +124,9 @@ class GatewayStore:
                     provider TEXT NOT NULL,
                     attempt_type TEXT NOT NULL CHECK (
                         attempt_type IN (
-                            'initial', 'repair', 'fallback', 'fallback_repair'
+                            'initial', 'repair', 'fallback', 'fallback_repair',
+                            'post_tool', 'post_tool_repair',
+                            'post_tool_fallback', 'post_tool_fallback_repair'
                         )
                     ),
                     status TEXT NOT NULL CHECK (
@@ -139,7 +143,9 @@ class GatewayStore:
                     ),
                     validation_error_category TEXT NULL CHECK (
                         validation_error_category IS NULL OR
-                        validation_error_category IN ('parsing', 'structure', 'semantic')
+                        validation_error_category IN (
+                            'parsing', 'structure', 'semantic', 'tool_protocol'
+                        )
                     ),
                     provider_error_category TEXT NULL CHECK (
                         provider_error_category IS NULL OR
@@ -167,8 +173,30 @@ class GatewayStore:
                     ),
                     PRIMARY KEY (virtual_key_id, preference_key)
                 );
+
+                CREATE TABLE IF NOT EXISTS task_tool_executions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    tool_number INTEGER NOT NULL CHECK (tool_number = 1),
+                    tool_name TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('running', 'completed', 'failed')
+                    ),
+                    error_category TEXT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+                    created_at TEXT NOT NULL DEFAULT (
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    completed_at TEXT NULL,
+                    FOREIGN KEY (task_id) REFERENCES task_executions(task_id),
+                    UNIQUE (task_id, tool_number)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_task_tools_task
+                ON task_tool_executions (task_id, tool_number);
                 """
             )
+            self._upgrade_task_attempt_schema(connection)
             for key, budget in SEEDED_KEYS.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO virtual_keys (key, budget) VALUES (?, ?)",
@@ -335,6 +363,91 @@ class GatewayStore:
         finally:
             connection.close()
 
+    @staticmethod
+    def _upgrade_task_attempt_schema(connection: sqlite3.Connection) -> None:
+        """Idempotently widen the Phase 3 CHECK constraint for bounded tool phases."""
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("task_attempts",),
+        ).fetchone()
+        if row is None or "post_tool" in row["sql"]:
+            return
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "ALTER TABLE task_attempts RENAME TO task_attempts_phase3"
+            )
+            connection.execute("DROP INDEX IF EXISTS idx_task_attempts_task")
+            connection.execute(
+                """
+                CREATE TABLE task_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+                    provider TEXT NOT NULL,
+                    attempt_type TEXT NOT NULL CHECK (
+                        attempt_type IN (
+                            'initial', 'repair', 'fallback', 'fallback_repair',
+                            'post_tool', 'post_tool_repair',
+                            'post_tool_fallback', 'post_tool_fallback_repair'
+                        )
+                    ),
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'completed', 'validation_error',
+                            'operational_error', 'configuration_error'
+                        )
+                    ),
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                        prompt_tokens >= 0
+                    ),
+                    completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                        completion_tokens >= 0
+                    ),
+                    validation_error_category TEXT NULL CHECK (
+                        validation_error_category IS NULL OR
+                        validation_error_category IN (
+                            'parsing', 'structure', 'semantic', 'tool_protocol'
+                        )
+                    ),
+                    provider_error_category TEXT NULL CHECK (
+                        provider_error_category IS NULL OR
+                        provider_error_category IN ('operational', 'configuration')
+                    ),
+                    created_at TEXT NOT NULL DEFAULT (
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    FOREIGN KEY (task_id) REFERENCES task_executions(task_id),
+                    UNIQUE (task_id, attempt_number)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO task_attempts (
+                    id, task_id, attempt_number, provider, attempt_type, status,
+                    prompt_tokens, completion_tokens,
+                    validation_error_category, provider_error_category, created_at
+                )
+                SELECT id, task_id, attempt_number, provider, attempt_type, status,
+                       prompt_tokens, completion_tokens,
+                       validation_error_category, provider_error_category, created_at
+                FROM task_attempts_phase3
+                """
+            )
+            connection.execute("DROP TABLE task_attempts_phase3")
+            connection.execute(
+                """
+                CREATE INDEX idx_task_attempts_task
+                ON task_attempts (task_id, attempt_number)
+                """
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
     def append_task_attempt(
         self,
         task_id: str,
@@ -369,6 +482,64 @@ class GatewayStore:
             )
             if cursor.rowcount != 1:
                 raise sqlite3.IntegrityError("task attempt could not be recorded")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def create_task_tool_execution(
+        self,
+        task_id: str,
+        tool_number: int,
+        tool_name: str,
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                INSERT INTO task_tool_executions (
+                    task_id, tool_number, tool_name, status
+                )
+                SELECT ?, ?, ?, 'running'
+                FROM task_executions
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (task_id, tool_number, tool_name, task_id),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("tool execution could not be recorded")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finalize_task_tool_execution(
+        self,
+        task_id: str,
+        tool_number: int,
+        status: Literal["completed", "failed"],
+        error_category: str | None,
+        duration_ms: int,
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE task_tool_executions
+                SET status = ?, error_category = ?, duration_ms = ?,
+                    completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE task_id = ? AND tool_number = ? AND status = 'running'
+                """,
+                (status, error_category, duration_ms, task_id, tool_number),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("tool execution could not be finalized")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -449,6 +620,16 @@ class GatewayStore:
                 """,
                 (task_id,),
             ).fetchall()
+            tool_rows = connection.execute(
+                """
+                SELECT tool_number, tool_name, status, error_category,
+                       duration_ms, created_at, completed_at
+                FROM task_tool_executions
+                WHERE task_id = ?
+                ORDER BY tool_number ASC
+                """,
+                (task_id,),
+            ).fetchall()
         finally:
             connection.close()
 
@@ -472,6 +653,18 @@ class GatewayStore:
             )
             for item in attempt_rows
         )
+        tools = tuple(
+            StoredToolExecution(
+                tool_number=item["tool_number"],
+                tool_name=item["tool_name"],
+                status=cast(ToolTraceStatus, item["status"]),
+                error_category=item["error_category"],
+                duration_ms=item["duration_ms"],
+                created_at=item["created_at"],
+                completed_at=item["completed_at"],
+            )
+            for item in tool_rows
+        )
         return StoredTaskTrace(
             task_id=row["task_id"],
             status=cast(TraceStatus, row["status"]),
@@ -484,6 +677,7 @@ class GatewayStore:
             created_at=row["created_at"],
             completed_at=row["completed_at"],
             attempt_history=attempts,
+            tool_history=tools,
         )
 
     def get_preference_values(self, virtual_key_id: str) -> dict[str, str]:

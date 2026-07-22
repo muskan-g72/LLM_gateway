@@ -33,3 +33,6 @@ validation_rules:
   - Every key point must be a non-empty string grounded in the supplied text.
   - The output must not contain fields outside the declared output schema.
 maximum_repair_attempts: 1
+allowed_tools:
+  - calculator
+  - text_statistics

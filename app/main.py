@@ -22,8 +22,10 @@ from app.task_executor import (
     TaskInvalidOutputError,
     TaskProviderConfigurationError,
     TaskProvidersUnavailableError,
+    TaskToolExecutionError,
     TaskTraceRecordingError,
 )
+from app.tools import ToolError
 from app.tracing import StoreTraceRecorder
 
 
@@ -135,7 +137,16 @@ class TaskResponse(BaseModel):
 class TaskAttemptResponse(BaseModel):
     attempt_number: int
     provider: str
-    attempt_type: Literal["initial", "repair", "fallback", "fallback_repair"]
+    attempt_type: Literal[
+        "initial",
+        "repair",
+        "fallback",
+        "fallback_repair",
+        "post_tool",
+        "post_tool_repair",
+        "post_tool_fallback",
+        "post_tool_fallback_repair",
+    ]
     status: Literal[
         "completed",
         "validation_error",
@@ -143,9 +154,24 @@ class TaskAttemptResponse(BaseModel):
         "configuration_error",
     ]
     usage: TokenUsage
-    validation_error_category: Literal["parsing", "structure", "semantic"] | None
+    validation_error_category: Literal[
+        "parsing",
+        "structure",
+        "semantic",
+        "tool_protocol",
+    ] | None
     provider_error_category: Literal["operational", "configuration"] | None
     created_at: str
+
+
+class ToolTraceResponse(BaseModel):
+    tool_number: int
+    tool_name: str
+    status: Literal["running", "completed", "failed"]
+    error_category: str | None
+    duration_ms: int
+    created_at: str
+    completed_at: str | None
 
 
 class TaskTraceResponse(BaseModel):
@@ -159,6 +185,7 @@ class TaskTraceResponse(BaseModel):
     created_at: str
     completed_at: str | None
     attempt_history: list[TaskAttemptResponse]
+    tool_history: list[ToolTraceResponse] = Field(default_factory=list)
 
 
 class PreferencesRequest(BaseModel):
@@ -233,6 +260,8 @@ def _task_error_category(error: TaskExecutionError) -> str:
         return "validation"
     if isinstance(error, TaskTraceRecordingError):
         return "trace_recording"
+    if isinstance(error, TaskToolExecutionError):
+        return error.category
     if isinstance(error, TaskInternalError):
         return "internal"
     return "execution"
@@ -305,6 +334,8 @@ def execute_task(
         )
     except PromptBuildError:
         raise HTTPException(status_code=422, detail="invalid task input") from None
+    except ToolError:
+        raise HTTPException(status_code=500, detail="skill configuration error") from None
 
     reservation = store.reserve_request(key)
     if reservation == "unknown":
@@ -354,6 +385,11 @@ def execute_task(
                 status_code=500,
                 detail="task tracing failed",
             ) from None
+        if isinstance(error, TaskToolExecutionError):
+            raise HTTPException(
+                status_code=502,
+                detail="tool execution failed",
+            ) from None
         raise HTTPException(status_code=500, detail="task execution failed") from None
 
     try:
@@ -382,7 +418,11 @@ def execute_task(
     )
 
 
-@app.get("/v1/tasks/{task_id}", response_model=TaskTraceResponse)
+@app.get(
+    "/v1/tasks/{task_id}",
+    response_model=TaskTraceResponse,
+    response_model_exclude_defaults=True,
+)
 def get_task_trace(
     task_id: str,
     authorization: Annotated[str | None, Header()] = None,
@@ -426,6 +466,18 @@ def get_task_trace(
                 created_at=attempt.created_at,
             )
             for attempt in trace.attempt_history
+        ],
+        tool_history=[
+            ToolTraceResponse(
+                tool_number=tool.tool_number,
+                tool_name=tool.tool_name,
+                status=tool.status,
+                error_category=tool.error_category,
+                duration_ms=tool.duration_ms,
+                created_at=tool.created_at,
+                completed_at=tool.completed_at,
+            )
+            for tool in trace.tool_history
         ],
     )
 
