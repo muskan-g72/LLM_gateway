@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
 from app.output_validation import (
+    OutputParsingError,
+    OutputSemanticError,
+    OutputStructureError,
     OutputValidationError,
     OutputValidator,
     UnsupportedSkillOutputError,
@@ -19,6 +22,12 @@ from app.providers import (
     ProviderGateway,
 )
 from app.skills import SkillDefinition, SkillLoader
+from app.tracing import (
+    AttemptRecorder,
+    AttemptType,
+    ExecutionAttempt,
+    ValidationErrorCategory,
+)
 
 
 INVALID_OUTPUT_EXCERPT_LIMIT = 2_000
@@ -101,22 +110,72 @@ class TaskInternalError(TaskExecutionError):
     """A local task contract is inconsistent with the registered validator."""
 
 
+class TaskTraceRecordingError(TaskExecutionError):
+    """Execution stopped because safe attempt metadata could not be persisted."""
+
+
+@dataclass(frozen=True)
+class _Invocation:
+    attempt_number: int
+    provider: str
+    attempt_type: AttemptType
+    completion: ProviderCompletion
+
+
 @dataclass
 class _ExecutionState:
     attempts: int = 0
     completion_usage: list[CompletionUsage] = field(default_factory=list)
+    recorder: AttemptRecorder | None = None
+
+    def _record(self, attempt: ExecutionAttempt) -> None:
+        if self.recorder is None:
+            return
+        try:
+            self.recorder.record(attempt)
+        except Exception:
+            raise TaskTraceRecordingError(
+                "task attempt metadata could not be recorded",
+                self.attempts,
+                self.frozen_usage(),
+            ) from None
 
     def invoke(
         self,
         provider_gateway: ProviderGateway,
         provider_name: str,
         messages: list[dict[str, str]],
-    ) -> ProviderCompletion:
+        attempt_type: AttemptType,
+    ) -> _Invocation:
         self.attempts += 1
-        completion = provider_gateway.complete_with_provider(
-            provider_name,
-            [dict(message) for message in messages],
-        )
+        try:
+            completion = provider_gateway.complete_with_provider(
+                provider_name,
+                [dict(message) for message in messages],
+            )
+        except ProviderConfigurationError:
+            self._record(
+                ExecutionAttempt(
+                    attempt_number=self.attempts,
+                    provider=provider_name,
+                    attempt_type=attempt_type,
+                    status="configuration_error",
+                    provider_error_category="configuration",
+                )
+            )
+            raise
+        except ProviderError:
+            self._record(
+                ExecutionAttempt(
+                    attempt_number=self.attempts,
+                    provider=provider_name,
+                    attempt_type=attempt_type,
+                    status="operational_error",
+                    provider_error_category="operational",
+                )
+            )
+            raise
+
         self.completion_usage.append(
             CompletionUsage(
                 provider=completion.provider,
@@ -124,7 +183,34 @@ class _ExecutionState:
                 completion_tokens=completion.completion_tokens,
             )
         )
-        return completion
+        return _Invocation(
+            attempt_number=self.attempts,
+            provider=provider_name,
+            attempt_type=attempt_type,
+            completion=completion,
+        )
+
+    def record_completed(
+        self,
+        invocation: _Invocation,
+        validation_category: ValidationErrorCategory | None = None,
+    ) -> None:
+        completion = invocation.completion
+        self._record(
+            ExecutionAttempt(
+                attempt_number=invocation.attempt_number,
+                provider=invocation.provider,
+                attempt_type=invocation.attempt_type,
+                status=(
+                    "validation_error"
+                    if validation_category is not None
+                    else "completed"
+                ),
+                prompt_tokens=completion.prompt_tokens,
+                completion_tokens=completion.completion_tokens,
+                validation_error_category=validation_category,
+            )
+        )
 
     def frozen_usage(self) -> tuple[CompletionUsage, ...]:
         return tuple(self.completion_usage)
@@ -234,6 +320,14 @@ class TaskExecutor:
         preferences: dict[str, object] | None = None,
     ) -> PreparedTask:
         skill = self.skill_loader.load(skill_name)
+        return self.prepare_with_skill(skill, task_input, preferences)
+
+    def prepare_with_skill(
+        self,
+        skill: SkillDefinition,
+        task_input: dict[str, object],
+        preferences: dict[str, object] | None = None,
+    ) -> PreparedTask:
         messages = self.prompt_builder.build(skill, task_input, preferences)
         return PreparedTask(
             task_id=uuid4(),
@@ -242,15 +336,20 @@ class TaskExecutor:
             messages=tuple(dict(message) for message in messages),
         )
 
-    def execute(self, prepared: PreparedTask) -> TaskExecutionResult:
-        state = _ExecutionState()
+    def execute(
+        self,
+        prepared: PreparedTask,
+        recorder: AttemptRecorder | None = None,
+    ) -> TaskExecutionResult:
+        state = _ExecutionState(recorder=recorder)
         initial_messages = [dict(message) for message in prepared.messages]
 
         try:
-            primary_completion = state.invoke(
+            primary_invocation = state.invoke(
                 self.provider_gateway,
                 ProviderGateway.PRIMARY_PROVIDER,
                 initial_messages,
+                "initial",
             )
         except ProviderConfigurationError:
             raise self._configuration_error(state) from None
@@ -258,11 +357,7 @@ class TaskExecutor:
             return self._execute_fallback(prepared, state)
 
         try:
-            result = self.output_validator.validate(
-                prepared.skill,
-                prepared.task_input,
-                primary_completion.content,
-            )
+            result = self._validate_candidate(prepared, state, primary_invocation)
         except UnsupportedSkillOutputError:
             raise self._internal_error(state) from None
         except OutputValidationError as validation_error:
@@ -273,13 +368,14 @@ class TaskExecutor:
                 prepared.messages,
                 prepared.skill,
                 validation_error,
-                primary_completion.content,
+                primary_invocation.completion.content,
             )
             try:
-                repaired_completion = state.invoke(
+                repaired_invocation = state.invoke(
                     self.provider_gateway,
                     ProviderGateway.PRIMARY_PROVIDER,
                     repair_messages,
+                    "repair",
                 )
             except ProviderConfigurationError:
                 raise self._configuration_error(state) from None
@@ -287,18 +383,28 @@ class TaskExecutor:
                 return self._execute_fallback(prepared, state)
 
             try:
-                repaired_result = self.output_validator.validate(
-                    prepared.skill,
-                    prepared.task_input,
-                    repaired_completion.content,
+                repaired_result = self._validate_candidate(
+                    prepared,
+                    state,
+                    repaired_invocation,
                 )
             except UnsupportedSkillOutputError:
                 raise self._internal_error(state) from None
             except OutputValidationError as repaired_error:
                 raise self._invalid_output_error(state, repaired_error) from None
-            return self._success(prepared, state, repaired_completion, repaired_result)
+            return self._success(
+                prepared,
+                state,
+                repaired_invocation.completion,
+                repaired_result,
+            )
 
-        return self._success(prepared, state, primary_completion, result)
+        return self._success(
+            prepared,
+            state,
+            primary_invocation.completion,
+            result,
+        )
 
     def _execute_fallback(
         self,
@@ -307,10 +413,11 @@ class TaskExecutor:
     ) -> TaskExecutionResult:
         initial_messages = [dict(message) for message in prepared.messages]
         try:
-            fallback_completion = state.invoke(
+            fallback_invocation = state.invoke(
                 self.provider_gateway,
                 ProviderGateway.FALLBACK_PROVIDER,
                 initial_messages,
+                "fallback",
             )
         except ProviderConfigurationError:
             raise self._configuration_error(state) from None
@@ -318,11 +425,7 @@ class TaskExecutor:
             raise self._unavailable_error(state) from None
 
         try:
-            result = self.output_validator.validate(
-                prepared.skill,
-                prepared.task_input,
-                fallback_completion.content,
-            )
+            result = self._validate_candidate(prepared, state, fallback_invocation)
         except UnsupportedSkillOutputError:
             raise self._internal_error(state) from None
         except OutputValidationError as validation_error:
@@ -333,13 +436,14 @@ class TaskExecutor:
                 prepared.messages,
                 prepared.skill,
                 validation_error,
-                fallback_completion.content,
+                fallback_invocation.completion.content,
             )
             try:
-                repaired_completion = state.invoke(
+                repaired_invocation = state.invoke(
                     self.provider_gateway,
                     ProviderGateway.FALLBACK_PROVIDER,
                     repair_messages,
+                    "fallback_repair",
                 )
             except ProviderConfigurationError:
                 raise self._configuration_error(state) from None
@@ -347,18 +451,62 @@ class TaskExecutor:
                 raise self._unavailable_error(state) from None
 
             try:
-                repaired_result = self.output_validator.validate(
-                    prepared.skill,
-                    prepared.task_input,
-                    repaired_completion.content,
+                repaired_result = self._validate_candidate(
+                    prepared,
+                    state,
+                    repaired_invocation,
                 )
             except UnsupportedSkillOutputError:
                 raise self._internal_error(state) from None
             except OutputValidationError as repaired_error:
                 raise self._invalid_output_error(state, repaired_error) from None
-            return self._success(prepared, state, repaired_completion, repaired_result)
+            return self._success(
+                prepared,
+                state,
+                repaired_invocation.completion,
+                repaired_result,
+            )
 
-        return self._success(prepared, state, fallback_completion, result)
+        return self._success(
+            prepared,
+            state,
+            fallback_invocation.completion,
+            result,
+        )
+
+    def _validate_candidate(
+        self,
+        prepared: PreparedTask,
+        state: _ExecutionState,
+        invocation: _Invocation,
+    ) -> ValidatedOutput:
+        try:
+            result = self.output_validator.validate(
+                prepared.skill,
+                prepared.task_input,
+                invocation.completion.content,
+            )
+        except OutputValidationError as error:
+            category = self._validation_category(error)
+            if category is not None:
+                state.record_completed(invocation, category)
+            else:
+                state.record_completed(invocation)
+            raise
+        state.record_completed(invocation)
+        return result
+
+    @staticmethod
+    def _validation_category(
+        error: OutputValidationError,
+    ) -> ValidationErrorCategory | None:
+        if isinstance(error, OutputParsingError):
+            return "parsing"
+        if isinstance(error, OutputStructureError):
+            return "structure"
+        if isinstance(error, OutputSemanticError):
+            return "semantic"
+        return None
 
     @staticmethod
     def _success(

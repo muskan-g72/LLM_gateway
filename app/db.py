@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import sqlite3
+from hashlib import sha256
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
+
+from app.tracing import (
+    AttemptStatus,
+    AttemptType,
+    ExecutionAttempt,
+    ProviderErrorCategory,
+    StoredAttempt,
+    StoredTaskTrace,
+    TraceStatus,
+    ValidationErrorCategory,
+)
 
 
 ReservationResult = Literal["reserved", "unknown", "over_budget"]
@@ -14,6 +26,11 @@ SEEDED_KEYS = {
     "vk_tiny": 2,
     "vk_edge": 1,
 }
+
+
+def virtual_key_identifier(key: str) -> str:
+    """Return a stable pseudonymous owner ID without persisting a plaintext key."""
+    return sha256(key.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -48,6 +65,7 @@ class GatewayStore:
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def initialize(self) -> None:
@@ -75,6 +93,79 @@ class GatewayStore:
                     tokens_out INTEGER NOT NULL CHECK (tokens_out >= 0),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (virtual_key) REFERENCES virtual_keys(key)
+                );
+
+                CREATE TABLE IF NOT EXISTS task_executions (
+                    task_id TEXT PRIMARY KEY,
+                    virtual_key_id TEXT NOT NULL,
+                    skill TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('running', 'completed', 'failed')
+                    ),
+                    final_provider TEXT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
+                    completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                        completion_tokens >= 0
+                    ),
+                    error_category TEXT NULL,
+                    created_at TEXT NOT NULL DEFAULT (
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    completed_at TEXT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS task_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+                    provider TEXT NOT NULL,
+                    attempt_type TEXT NOT NULL CHECK (
+                        attempt_type IN (
+                            'initial', 'repair', 'fallback', 'fallback_repair'
+                        )
+                    ),
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'completed', 'validation_error',
+                            'operational_error', 'configuration_error'
+                        )
+                    ),
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                        prompt_tokens >= 0
+                    ),
+                    completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                        completion_tokens >= 0
+                    ),
+                    validation_error_category TEXT NULL CHECK (
+                        validation_error_category IS NULL OR
+                        validation_error_category IN ('parsing', 'structure', 'semantic')
+                    ),
+                    provider_error_category TEXT NULL CHECK (
+                        provider_error_category IS NULL OR
+                        provider_error_category IN ('operational', 'configuration')
+                    ),
+                    created_at TEXT NOT NULL DEFAULT (
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    FOREIGN KEY (task_id) REFERENCES task_executions(task_id),
+                    UNIQUE (task_id, attempt_number)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_task_executions_owner
+                ON task_executions (virtual_key_id, task_id);
+
+                CREATE INDEX IF NOT EXISTS idx_task_attempts_task
+                ON task_attempts (task_id, attempt_number);
+
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    virtual_key_id TEXT NOT NULL,
+                    preference_key TEXT NOT NULL,
+                    preference_value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    PRIMARY KEY (virtual_key_id, preference_key)
                 );
                 """
             )
@@ -148,36 +239,320 @@ class GatewayStore:
         self,
         key: str,
         events: Sequence[tuple[str, int, int]],
+        *,
+        task_id: str | None = None,
+        trace_status: Literal["completed", "failed"] | None = None,
+        final_provider: str | None = None,
+        attempts: int | None = None,
+        error_category: str | None = None,
     ) -> None:
-        """Atomically record every completion reported for one admitted request."""
-        if not events:
+        """Record completion usage and optionally finalize its task trace atomically."""
+        if not events and task_id is None:
             return
+
+        if (task_id is None) != (trace_status is None):
+            raise ValueError("task trace finalization fields must be supplied together")
+        if task_id is not None and attempts is None:
+            raise ValueError("task trace finalization requires an attempt count")
 
         token_input_total = sum(tokens_in for _, tokens_in, _ in events)
         token_output_total = sum(tokens_out for _, _, tokens_out in events)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if events:
+                connection.execute(
+                    """
+                    UPDATE virtual_keys
+                    SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?
+                    WHERE key = ?
+                    """,
+                    (token_input_total, token_output_total, key),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO usage_events
+                        (virtual_key, provider, tokens_in, tokens_out)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (key, provider, tokens_in, tokens_out)
+                        for provider, tokens_in, tokens_out in events
+                    ],
+                )
+
+            if task_id is not None and trace_status is not None:
+                cursor = connection.execute(
+                    """
+                    UPDATE task_executions
+                    SET status = ?, final_provider = ?, attempts = ?,
+                        prompt_tokens = ?, completion_tokens = ?,
+                        error_category = ?,
+                        completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE task_id = ? AND virtual_key_id = ? AND status = 'running'
+                    """,
+                    (
+                        trace_status,
+                        final_provider,
+                        attempts,
+                        token_input_total,
+                        token_output_total,
+                        error_category,
+                        task_id,
+                        virtual_key_identifier(key),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise sqlite3.IntegrityError("task trace could not be finalized")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def create_task_execution(
+        self,
+        task_id: str,
+        virtual_key_id: str,
+        skill: str,
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO task_executions
+                    (task_id, virtual_key_id, skill, status)
+                VALUES (?, ?, ?, 'running')
+                """,
+                (task_id, virtual_key_id, skill),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def append_task_attempt(
+        self,
+        task_id: str,
+        attempt: ExecutionAttempt,
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                INSERT INTO task_attempts (
+                    task_id, attempt_number, provider, attempt_type, status,
+                    prompt_tokens, completion_tokens,
+                    validation_error_category, provider_error_category
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                FROM task_executions
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (
+                    task_id,
+                    attempt.attempt_number,
+                    attempt.provider,
+                    attempt.attempt_type,
+                    attempt.status,
+                    attempt.prompt_tokens,
+                    attempt.completion_tokens,
+                    attempt.validation_error_category,
+                    attempt.provider_error_category,
+                    task_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("task attempt could not be recorded")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finalize_failed_task_without_usage(
+        self,
+        key: str,
+        task_id: str,
+        attempts: int,
+        error_category: str,
+    ) -> None:
+        """Atomically release an unbilled reservation and fail its running trace."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE task_executions
+                SET status = 'failed', attempts = ?, error_category = ?,
+                    completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE task_id = ? AND virtual_key_id = ? AND status = 'running'
+                """,
+                (
+                    attempts,
+                    error_category,
+                    task_id,
+                    virtual_key_identifier(key),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("task trace could not be finalized")
             connection.execute(
                 """
                 UPDATE virtual_keys
-                SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?
+                SET requests = CASE WHEN requests > 0 THEN requests - 1 ELSE 0 END
                 WHERE key = ?
                 """,
-                (token_input_total, token_output_total, key),
+                (key,),
             )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_task_execution(
+        self,
+        task_id: str,
+        virtual_key_id: str,
+    ) -> StoredTaskTrace | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT task_id, status, skill, final_provider, attempts,
+                       prompt_tokens, completion_tokens, error_category,
+                       created_at, completed_at
+                FROM task_executions
+                WHERE task_id = ? AND virtual_key_id = ?
+                """,
+                (task_id, virtual_key_id),
+            ).fetchone()
+            if row is None:
+                return None
+            attempt_rows = connection.execute(
+                """
+                SELECT attempt_number, provider, attempt_type, status,
+                       prompt_tokens, completion_tokens,
+                       validation_error_category, provider_error_category,
+                       created_at
+                FROM task_attempts
+                WHERE task_id = ?
+                ORDER BY attempt_number ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        attempts = tuple(
+            StoredAttempt(
+                attempt_number=item["attempt_number"],
+                provider=item["provider"],
+                attempt_type=cast(AttemptType, item["attempt_type"]),
+                status=cast(AttemptStatus, item["status"]),
+                prompt_tokens=item["prompt_tokens"],
+                completion_tokens=item["completion_tokens"],
+                validation_error_category=cast(
+                    ValidationErrorCategory | None,
+                    item["validation_error_category"],
+                ),
+                provider_error_category=cast(
+                    ProviderErrorCategory | None,
+                    item["provider_error_category"],
+                ),
+                created_at=item["created_at"],
+            )
+            for item in attempt_rows
+        )
+        return StoredTaskTrace(
+            task_id=row["task_id"],
+            status=cast(TraceStatus, row["status"]),
+            skill=row["skill"],
+            final_provider=row["final_provider"],
+            attempts=row["attempts"],
+            prompt_tokens=row["prompt_tokens"],
+            completion_tokens=row["completion_tokens"],
+            error_category=row["error_category"],
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+            attempt_history=attempts,
+        )
+
+    def get_preference_values(self, virtual_key_id: str) -> dict[str, str]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT preference_key, preference_value_json
+                FROM user_preferences
+                WHERE virtual_key_id = ?
+                ORDER BY preference_key ASC
+                """,
+                (virtual_key_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return {
+            row["preference_key"]: row["preference_value_json"] for row in rows
+        }
+
+    def upsert_preference_values(
+        self,
+        virtual_key_id: str,
+        values: dict[str, str],
+    ) -> None:
+        if not values:
+            return
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
             connection.executemany(
                 """
-                INSERT INTO usage_events
-                    (virtual_key, provider, tokens_in, tokens_out)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO user_preferences (
+                    virtual_key_id, preference_key, preference_value_json
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT (virtual_key_id, preference_key) DO UPDATE SET
+                    preference_value_json = excluded.preference_value_json,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 [
-                    (key, provider, tokens_in, tokens_out)
-                    for provider, tokens_in, tokens_out in events
+                    (virtual_key_id, name, value)
+                    for name, value in values.items()
                 ],
             )
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def delete_preference_value(
+        self,
+        virtual_key_id: str,
+        preference_key: str,
+    ) -> bool:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                DELETE FROM user_preferences
+                WHERE virtual_key_id = ? AND preference_key = ?
+                """,
+                (virtual_key_id, preference_key),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
         except Exception:
             connection.rollback()
             raise

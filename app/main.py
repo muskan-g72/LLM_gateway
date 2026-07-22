@@ -4,11 +4,12 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.config import get_settings
-from app.db import GatewayStore
+from app.db import GatewayStore, virtual_key_identifier
+from app.memory import PreferenceError, PreferenceService
 from app.output_validation import OutputValidator
 from app.prompt_builder import PromptBuildError, PromptBuilder
 from app.providers import ProviderError, ProviderGateway
@@ -21,7 +22,9 @@ from app.task_executor import (
     TaskInvalidOutputError,
     TaskProviderConfigurationError,
     TaskProvidersUnavailableError,
+    TaskTraceRecordingError,
 )
+from app.tracing import StoreTraceRecorder
 
 
 settings = get_settings()
@@ -129,6 +132,45 @@ class TaskResponse(BaseModel):
     usage: TokenUsage
 
 
+class TaskAttemptResponse(BaseModel):
+    attempt_number: int
+    provider: str
+    attempt_type: Literal["initial", "repair", "fallback", "fallback_repair"]
+    status: Literal[
+        "completed",
+        "validation_error",
+        "operational_error",
+        "configuration_error",
+    ]
+    usage: TokenUsage
+    validation_error_category: Literal["parsing", "structure", "semantic"] | None
+    provider_error_category: Literal["operational", "configuration"] | None
+    created_at: str
+
+
+class TaskTraceResponse(BaseModel):
+    task_id: str
+    status: Literal["running", "completed", "failed"]
+    skill: str
+    provider: str | None
+    attempts: int
+    usage: TokenUsage
+    error_category: str | None
+    created_at: str
+    completed_at: str | None
+    attempt_history: list[TaskAttemptResponse]
+
+
+class PreferencesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preferences: dict[str, object]
+
+
+class PreferencesResponse(BaseModel):
+    preferences: dict[str, object]
+
+
 def _virtual_key(authorization: str | None) -> str:
     if authorization is None:
         raise HTTPException(status_code=401, detail="missing or unknown virtual key")
@@ -182,15 +224,42 @@ def _usage_event_tuples(
     ]
 
 
-def _settle_failed_task(key: str, error: TaskExecutionError) -> None:
+def _task_error_category(error: TaskExecutionError) -> str:
+    if isinstance(error, TaskProviderConfigurationError):
+        return "configuration"
+    if isinstance(error, TaskProvidersUnavailableError):
+        return "operational"
+    if isinstance(error, TaskInvalidOutputError):
+        return "validation"
+    if isinstance(error, TaskTraceRecordingError):
+        return "trace_recording"
+    if isinstance(error, TaskInternalError):
+        return "internal"
+    return "execution"
+
+
+def _settle_failed_task(
+    key: str,
+    task_id: str,
+    error: TaskExecutionError,
+) -> None:
     try:
         if error.completion_usage:
             store.record_usage_events(
                 key,
                 _usage_event_tuples(error.completion_usage),
+                task_id=task_id,
+                trace_status="failed",
+                attempts=error.attempts,
+                error_category=_task_error_category(error),
             )
         else:
-            store.release_request(key)
+            store.finalize_failed_task_without_usage(
+                key,
+                task_id,
+                error.attempts,
+                _task_error_category(error),
+            )
     except Exception:
         raise HTTPException(status_code=500, detail="task accounting failed") from None
 
@@ -205,17 +274,37 @@ def execute_task(
         raise HTTPException(status_code=401, detail="missing or unknown virtual key")
 
     try:
-        prepared = task_executor.prepare(
-            request.skill,
-            request.input,
-            request.preferences,
-        )
+        skill = task_executor.skill_loader.load(request.skill)
     except UnknownSkillError:
         raise HTTPException(status_code=404, detail="unknown skill") from None
-    except PromptBuildError:
-        raise HTTPException(status_code=422, detail="invalid task input") from None
     except SkillError:
         raise HTTPException(status_code=500, detail="skill configuration error") from None
+
+    owner_id = virtual_key_identifier(key)
+    preference_service = PreferenceService(store)
+    try:
+        stored_preferences = preference_service.get(owner_id)
+        effective_preferences = preference_service.merge(
+            stored_preferences,
+            request.preferences,
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="preference storage failed") from None
+
+    prompt_preferences: dict[str, object] | None
+    if effective_preferences or request.preferences is not None:
+        prompt_preferences = effective_preferences
+    else:
+        prompt_preferences = None
+
+    try:
+        prepared = task_executor.prepare_with_skill(
+            skill,
+            request.input,
+            prompt_preferences,
+        )
+    except PromptBuildError:
+        raise HTTPException(status_code=422, detail="invalid task input") from None
 
     reservation = store.reserve_request(key)
     if reservation == "unknown":
@@ -223,10 +312,23 @@ def execute_task(
     if reservation == "over_budget":
         raise HTTPException(status_code=429, detail="virtual key budget exhausted")
 
+    task_id = str(prepared.task_id)
     try:
-        result = task_executor.execute(prepared)
+        store.create_task_execution(task_id, owner_id, prepared.skill.name)
+    except Exception:
+        try:
+            store.release_request(key)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="task tracing failed") from None
+
+    try:
+        result = task_executor.execute(
+            prepared,
+            StoreTraceRecorder(store, task_id),
+        )
     except TaskExecutionError as error:
-        _settle_failed_task(key, error)
+        _settle_failed_task(key, task_id, error)
         if isinstance(error, TaskProviderConfigurationError):
             raise HTTPException(
                 status_code=500,
@@ -247,12 +349,21 @@ def execute_task(
                 status_code=502,
                 detail="all providers unavailable",
             ) from None
+        if isinstance(error, TaskTraceRecordingError):
+            raise HTTPException(
+                status_code=500,
+                detail="task tracing failed",
+            ) from None
         raise HTTPException(status_code=500, detail="task execution failed") from None
 
     try:
         store.record_usage_events(
             key,
             _usage_event_tuples(result.completion_usage),
+            task_id=task_id,
+            trace_status="completed",
+            final_provider=result.provider,
+            attempts=result.attempts,
         )
     except Exception:
         raise HTTPException(status_code=500, detail="task accounting failed") from None
@@ -269,6 +380,106 @@ def execute_task(
             completion_tokens=result.usage.completion_tokens,
         ),
     )
+
+
+@app.get("/v1/tasks/{task_id}", response_model=TaskTraceResponse)
+def get_task_trace(
+    task_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> TaskTraceResponse:
+    key = _virtual_key(authorization)
+    if store.get_usage(key) is None:
+        raise HTTPException(status_code=401, detail="missing or unknown virtual key")
+
+    try:
+        trace = store.get_task_execution(task_id, virtual_key_identifier(key))
+    except Exception:
+        raise HTTPException(status_code=500, detail="task trace lookup failed") from None
+    if trace is None:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    return TaskTraceResponse(
+        task_id=trace.task_id,
+        status=trace.status,
+        skill=trace.skill,
+        provider=trace.final_provider,
+        attempts=trace.attempts,
+        usage=TokenUsage(
+            prompt_tokens=trace.prompt_tokens,
+            completion_tokens=trace.completion_tokens,
+        ),
+        error_category=trace.error_category,
+        created_at=trace.created_at,
+        completed_at=trace.completed_at,
+        attempt_history=[
+            TaskAttemptResponse(
+                attempt_number=attempt.attempt_number,
+                provider=attempt.provider,
+                attempt_type=attempt.attempt_type,
+                status=attempt.status,
+                usage=TokenUsage(
+                    prompt_tokens=attempt.prompt_tokens,
+                    completion_tokens=attempt.completion_tokens,
+                ),
+                validation_error_category=attempt.validation_error_category,
+                provider_error_category=attempt.provider_error_category,
+                created_at=attempt.created_at,
+            )
+            for attempt in trace.attempt_history
+        ],
+    )
+
+
+def _authenticated_owner_id(authorization: str | None) -> str:
+    key = _virtual_key(authorization)
+    if store.get_usage(key) is None:
+        raise HTTPException(status_code=401, detail="missing or unknown virtual key")
+    return virtual_key_identifier(key)
+
+
+@app.get("/v1/preferences", response_model=PreferencesResponse)
+def get_preferences(
+    authorization: Annotated[str | None, Header()] = None,
+) -> PreferencesResponse:
+    owner_id = _authenticated_owner_id(authorization)
+    try:
+        preferences = PreferenceService(store).get(owner_id)
+    except Exception:
+        raise HTTPException(status_code=500, detail="preference storage failed") from None
+    return PreferencesResponse(preferences=preferences)
+
+
+@app.put("/v1/preferences", response_model=PreferencesResponse)
+def put_preferences(
+    request: PreferencesRequest,
+    authorization: Annotated[str | None, Header()] = None,
+) -> PreferencesResponse:
+    owner_id = _authenticated_owner_id(authorization)
+    try:
+        preferences = PreferenceService(store).put(
+            owner_id,
+            request.preferences,
+        )
+    except PreferenceError:
+        raise HTTPException(status_code=422, detail="invalid preferences") from None
+    except Exception:
+        raise HTTPException(status_code=500, detail="preference storage failed") from None
+    return PreferencesResponse(preferences=preferences)
+
+
+@app.delete("/v1/preferences/{preference_key}", status_code=204)
+def delete_preference(
+    preference_key: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> Response:
+    owner_id = _authenticated_owner_id(authorization)
+    try:
+        PreferenceService(store).delete(owner_id, preference_key)
+    except PreferenceError:
+        raise HTTPException(status_code=422, detail="invalid preference name") from None
+    except Exception:
+        raise HTTPException(status_code=500, detail="preference storage failed") from None
+    return Response(status_code=204)
 
 
 @app.get("/usage", response_model=UsageResponse)
