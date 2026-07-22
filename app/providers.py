@@ -11,6 +11,14 @@ class ProviderError(Exception):
     """A deliberately detail-free provider error so credentials cannot leak."""
 
 
+class ProviderOperationalError(ProviderError):
+    """A transient or unusable provider operation that may justify fallback."""
+
+
+class ProviderConfigurationError(ProviderError):
+    """A local credential, model, or request configuration problem."""
+
+
 @dataclass(frozen=True)
 class ProviderCompletion:
     content: str
@@ -20,23 +28,50 @@ class ProviderCompletion:
 
 
 class ProviderGateway:
+    PRIMARY_PROVIDER = "groq"
+    FALLBACK_PROVIDER = "gemini"
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
     def complete(self, messages: list[dict[str, str]]) -> ProviderCompletion:
         try:
-            if self.settings.force_primary_fail:
-                raise ProviderError("primary disabled by failure injection")
-            return self._complete_with_groq(messages)
+            return self.complete_with_provider(self.PRIMARY_PROVIDER, messages)
         except ProviderError:
+            return self.complete_with_provider(self.FALLBACK_PROVIDER, messages)
+
+    def complete_with_provider(
+        self,
+        provider_name: str,
+        messages: list[dict[str, str]],
+    ) -> ProviderCompletion:
+        if provider_name == self.PRIMARY_PROVIDER:
+            if self.settings.force_primary_fail:
+                raise ProviderOperationalError(
+                    "primary disabled by failure injection"
+                )
+            return self._complete_with_groq(messages)
+        if provider_name == self.FALLBACK_PROVIDER:
             return self._complete_with_gemini(messages)
+        raise ProviderConfigurationError("unknown provider selection")
+
+    @staticmethod
+    def _raise_for_failed_status(response: httpx.Response) -> None:
+        status_code = getattr(response, "status_code", None)
+        if status_code in {408, 429} or (
+            isinstance(status_code, int) and status_code >= 500
+        ):
+            raise ProviderOperationalError("provider request failed operationally")
+        raise ProviderConfigurationError("provider request configuration was rejected")
 
     def _complete_with_groq(
         self,
         messages: list[dict[str, str]],
     ) -> ProviderCompletion:
         if not self.settings.groq_api_key:
-            raise ProviderError("primary provider is not configured")
+            raise ProviderConfigurationError("primary provider is not configured")
+        if not self.settings.groq_model:
+            raise ProviderConfigurationError("primary model is not configured")
 
         try:
             response = httpx.post(
@@ -55,20 +90,24 @@ class ProviderGateway:
                 timeout=self.settings.provider_timeout_seconds,
             )
             if not response.is_success:
-                raise ProviderError("primary provider request failed")
+                self._raise_for_failed_status(response)
 
             payload = response.json()
             content = payload["choices"][0]["message"]["content"]
             prompt_tokens = int(payload["usage"]["prompt_tokens"])
             completion_tokens = int(payload["usage"]["completion_tokens"])
             if not isinstance(content, str) or not content.strip():
-                raise ProviderError("primary provider returned no text")
+                raise ProviderOperationalError("primary provider returned no text")
             if prompt_tokens <= 0 or completion_tokens <= 0:
-                raise ProviderError("primary provider returned invalid usage")
+                raise ProviderOperationalError(
+                    "primary provider returned invalid usage"
+                )
         except ProviderError:
             raise
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
-            raise ProviderError("primary provider response was unusable") from None
+            raise ProviderOperationalError(
+                "primary provider response was unusable"
+            ) from None
 
         return ProviderCompletion(
             content=content,
@@ -82,7 +121,9 @@ class ProviderGateway:
         messages: list[dict[str, str]],
     ) -> ProviderCompletion:
         if not self.settings.gemini_api_key:
-            raise ProviderError("fallback provider is not configured")
+            raise ProviderConfigurationError("fallback provider is not configured")
+        if not self.settings.gemini_model:
+            raise ProviderConfigurationError("fallback model is not configured")
 
         system_parts = [
             {"text": message["content"]}
@@ -118,7 +159,7 @@ class ProviderGateway:
                 timeout=self.settings.provider_timeout_seconds,
             )
             if not response.is_success:
-                raise ProviderError("fallback provider request failed")
+                self._raise_for_failed_status(response)
 
             payload = response.json()
             parts = payload["candidates"][0]["content"]["parts"]
@@ -131,13 +172,17 @@ class ProviderGateway:
             prompt_tokens = int(usage["promptTokenCount"])
             completion_tokens = int(usage["candidatesTokenCount"])
             if not content.strip():
-                raise ProviderError("fallback provider returned no text")
+                raise ProviderOperationalError("fallback provider returned no text")
             if prompt_tokens <= 0 or completion_tokens <= 0:
-                raise ProviderError("fallback provider returned invalid usage")
+                raise ProviderOperationalError(
+                    "fallback provider returned invalid usage"
+                )
         except ProviderError:
             raise
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
-            raise ProviderError("fallback provider response was unusable") from None
+            raise ProviderOperationalError(
+                "fallback provider response was unusable"
+            ) from None
 
         return ProviderCompletion(
             content=content,

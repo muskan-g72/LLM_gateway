@@ -22,6 +22,10 @@ class PromptSerializationError(PromptBuildError):
     """Raised when validated prompt data still cannot be serialized."""
 
 
+class InvalidTaskInputError(PromptBuildError):
+    """Raised when a required value violates its declared primitive schema."""
+
+
 def _ensure_json_compatible(
     value: object,
     label: str,
@@ -84,6 +88,27 @@ def _canonical_json(value: object, label: str) -> str:
         raise PromptSerializationError(f"{label} could not be serialized") from None
 
 
+def _validate_required_input_values(
+    skill: SkillDefinition,
+    task_input: dict[str, object],
+) -> None:
+    """Check the primitive constraints used by the two current required inputs."""
+    for field_name in skill.expected_input.required:
+        field_schema = skill.expected_input.properties[field_name]
+        value = task_input[field_name]
+        if field_schema.get("type") != "string":
+            continue
+        if type(value) is not str:
+            raise InvalidTaskInputError(
+                f"task input field '{field_name}' must be a string"
+            )
+        minimum_length = field_schema.get("minLength")
+        if type(minimum_length) is int and len(value) < minimum_length:
+            raise InvalidTaskInputError(
+                f"task input field '{field_name}' is shorter than allowed"
+            )
+
+
 class PromptBuilder:
     """Build provider-neutral system and user messages from trusted skill data."""
 
@@ -104,6 +129,8 @@ class PromptBuilder:
         if missing_fields:
             names = ", ".join(missing_fields)
             raise MissingRequiredInputError(f"task input is missing required fields: {names}")
+
+        _validate_required_input_values(skill, task_input)
 
         task_input_json = _canonical_json(task_input, "task input")
         preferences_json = (

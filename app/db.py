@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -141,6 +142,19 @@ class GatewayStore:
         tokens_in: int,
         tokens_out: int,
     ) -> None:
+        self.record_usage_events(key, [(provider, tokens_in, tokens_out)])
+
+    def record_usage_events(
+        self,
+        key: str,
+        events: Sequence[tuple[str, int, int]],
+    ) -> None:
+        """Atomically record every completion reported for one admitted request."""
+        if not events:
+            return
+
+        token_input_total = sum(tokens_in for _, tokens_in, _ in events)
+        token_output_total = sum(tokens_out for _, _, tokens_out in events)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -150,15 +164,18 @@ class GatewayStore:
                 SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?
                 WHERE key = ?
                 """,
-                (tokens_in, tokens_out, key),
+                (token_input_total, token_output_total, key),
             )
-            connection.execute(
+            connection.executemany(
                 """
                 INSERT INTO usage_events
                     (virtual_key, provider, tokens_in, tokens_out)
                 VALUES (?, ?, ?, ?)
                 """,
-                (key, provider, tokens_in, tokens_out),
+                [
+                    (key, provider, tokens_in, tokens_out)
+                    for provider, tokens_in, tokens_out in events
+                ],
             )
             connection.commit()
         except Exception:
