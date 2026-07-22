@@ -1,0 +1,35 @@
+name: summarize
+purpose: Create a concise summary and a short list of important points from supplied text.
+system_instructions: |
+  Summarize only information supported by the supplied text.
+  Preserve important qualifications and do not invent missing facts.
+expected_input:
+  type: object
+  properties:
+    text:
+      type: string
+      minLength: 1
+      description: The source text to summarize.
+  required:
+    - text
+  additionalProperties: false
+output_schema:
+  type: object
+  properties:
+    summary:
+      type: string
+      minLength: 1
+    key_points:
+      type: array
+      items:
+        type: string
+        minLength: 1
+  required:
+    - summary
+    - key_points
+  additionalProperties: false
+validation_rules:
+  - The summary must contain non-whitespace text.
+  - Every key point must be a non-empty string grounded in the supplied text.
+  - The output must not contain fields outside the declared output schema.
+maximum_repair_attempts: 1

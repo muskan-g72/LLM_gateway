@@ -1,0 +1,47 @@
+name: extract_action_items
+purpose: Extract explicit action items, including an owner or deadline when the source provides one.
+system_instructions: |
+  Extract only tasks supported by the supplied text.
+  Do not infer an owner or deadline when it is not stated; use null instead.
+expected_input:
+  type: object
+  properties:
+    text:
+      type: string
+      minLength: 1
+      description: The source text from which action items are extracted.
+  required:
+    - text
+  additionalProperties: false
+output_schema:
+  type: object
+  properties:
+    action_items:
+      type: array
+      items:
+        type: object
+        properties:
+          task:
+            type: string
+            minLength: 1
+          owner:
+            anyOf:
+              - type: string
+              - type: "null"
+          deadline:
+            anyOf:
+              - type: string
+              - type: "null"
+        required:
+          - task
+          - owner
+          - deadline
+        additionalProperties: false
+  required:
+    - action_items
+  additionalProperties: false
+validation_rules:
+  - Every action item must describe an explicit task grounded in the supplied text.
+  - Owner and deadline must be copied from the text or set to null when absent.
+  - The output must not contain fields outside the declared output schema.
+maximum_repair_attempts: 1
