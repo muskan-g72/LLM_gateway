@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterator
-from pathlib import Path
 from threading import Lock
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import inspect
 
 from app import main as main_module
 from app.db import GatewayStore
@@ -19,6 +18,7 @@ from app.prompt_builder import PromptBuilder
 from app.providers import ProviderCompletion, ProviderOperationalError
 from app.skills import SkillLoader
 from app.task_executor import TaskExecutor
+from app.tracing import ExecutionAttempt
 from app.tools import (
     CalculatorInput,
     CalculatorOutput,
@@ -27,6 +27,7 @@ from app.tools import (
     ToolRegistry,
     build_builtin_tool_registry,
 )
+from tests.database_helpers import fetch_all, fetch_scalar, table_columns, table_names
 
 
 ProviderEvent = ProviderCompletion | Exception
@@ -127,23 +128,18 @@ def _trace(client: TestClient, task_id: str, key: str = "vk_open"):
 
 
 def _only_task_id(store: GatewayStore) -> str:
-    connection = sqlite3.connect(store.database_path)
-    try:
-        row = connection.execute(
-            "SELECT task_id FROM task_executions ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-    finally:
-        connection.close()
-    assert row is not None
-    return str(row[0])
+    task_id = fetch_scalar(
+        store,
+        "SELECT task_id FROM task_executions ORDER BY created_at DESC LIMIT 1",
+    )
+    assert task_id is not None
+    return str(task_id)
 
 
 def _usage_event_count(store: GatewayStore) -> int:
-    connection = sqlite3.connect(store.database_path)
-    try:
-        return int(connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0])
-    finally:
-        connection.close()
+    count = fetch_scalar(store, "SELECT COUNT(*) FROM usage_events")
+    assert count is not None
+    return int(count)
 
 
 def test_calculator_endpoint_success_preserves_task_response_contract(
@@ -399,19 +395,8 @@ def test_tool_trace_does_not_persist_arguments_results_or_exception_text(
     )
     assert _post_task(client).status_code == 200
 
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        columns = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(task_tool_executions)"
-            ).fetchall()
-        }
-        values = connection.execute(
-            "SELECT * FROM task_tool_executions"
-        ).fetchall()
-    finally:
-        connection.close()
+    columns = table_columns(test_store, "task_tool_executions")
+    values = fetch_all(test_store, "SELECT * FROM task_tool_executions")
 
     assert {"arguments", "result", "prompt", "raw_output"}.isdisjoint(columns)
     assert argument_secret not in repr(values)
@@ -461,7 +446,7 @@ def test_tool_recording_failure_stops_before_post_tool_call(
     )
 
     def fail_tool_finish(*args: object, **kwargs: object) -> None:
-        raise sqlite3.OperationalError("PRIVATE SQL")
+        raise RuntimeError("PRIVATE SQL")
 
     monkeypatch.setattr(test_store, "finalize_task_tool_execution", fail_tool_finish)
 
@@ -482,93 +467,35 @@ def test_tool_schema_initialization_is_idempotent_and_attempt_types_are_widened(
     test_store: GatewayStore,
 ) -> None:
     test_store.initialize()
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        table_sql = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_attempts'"
-        ).fetchone()[0]
-        tool_table = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='task_tool_executions'"
-        ).fetchone()
-    finally:
-        connection.close()
-
-    assert "post_tool_fallback_repair" in table_sql
-    assert tool_table == ("task_tool_executions",)
+    checks = inspect(test_store.engine).get_check_constraints("task_attempts")
+    assert any(
+        "post_tool_fallback_repair" in (constraint["sqltext"] or "")
+        for constraint in checks
+    )
+    assert "task_tool_executions" in table_names(test_store)
 
 
-def test_phase_three_attempt_rows_survive_the_targeted_schema_upgrade(
-    tmp_path: Path,
+def test_existing_attempt_rows_survive_idempotent_alembic_initialization(
+    test_store: GatewayStore,
 ) -> None:
-    database_path = tmp_path / "phase3.db"
-    connection = sqlite3.connect(database_path)
-    try:
-        connection.executescript(
-            """
-            CREATE TABLE task_executions (
-                task_id TEXT PRIMARY KEY,
-                virtual_key_id TEXT NOT NULL,
-                skill TEXT NOT NULL,
-                status TEXT NOT NULL,
-                final_provider TEXT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                prompt_tokens INTEGER NOT NULL DEFAULT 0,
-                completion_tokens INTEGER NOT NULL DEFAULT 0,
-                error_category TEXT NULL,
-                created_at TEXT NOT NULL,
-                completed_at TEXT NULL
-            );
-            CREATE TABLE task_attempts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id TEXT NOT NULL,
-                attempt_number INTEGER NOT NULL,
-                provider TEXT NOT NULL,
-                attempt_type TEXT NOT NULL CHECK (
-                    attempt_type IN ('initial', 'repair', 'fallback', 'fallback_repair')
-                ),
-                status TEXT NOT NULL,
-                prompt_tokens INTEGER NOT NULL DEFAULT 0,
-                completion_tokens INTEGER NOT NULL DEFAULT 0,
-                validation_error_category TEXT NULL,
-                provider_error_category TEXT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (task_id) REFERENCES task_executions(task_id),
-                UNIQUE (task_id, attempt_number)
-            );
-            INSERT INTO task_executions (
-                task_id, virtual_key_id, skill, status, attempts,
-                prompt_tokens, completion_tokens, created_at, completed_at
-            ) VALUES (
-                'old-task', 'internal-owner', 'summarize', 'completed', 1,
-                2, 3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z'
-            );
-            INSERT INTO task_attempts (
-                task_id, attempt_number, provider, attempt_type, status,
-                prompt_tokens, completion_tokens, created_at
-            ) VALUES (
-                'old-task', 1, 'groq', 'initial', 'completed',
-                2, 3, '2026-01-01T00:00:00Z'
-            );
-            """
-        )
-    finally:
-        connection.close()
+    test_store.create_task_execution("old-task", "internal-owner", "summarize")
+    test_store.append_task_attempt(
+        "old-task",
+        ExecutionAttempt(1, "groq", "initial", "completed", 2, 3),
+    )
+    test_store.initialize()
 
-    GatewayStore(str(database_path)).initialize()
+    retained = fetch_all(
+        test_store,
+        "SELECT task_id, attempt_number, attempt_type FROM task_attempts",
+    )
+    checks = inspect(test_store.engine).get_check_constraints("task_attempts")
 
-    connection = sqlite3.connect(database_path)
-    try:
-        retained = connection.execute(
-            "SELECT task_id, attempt_number, attempt_type FROM task_attempts"
-        ).fetchall()
-        table_sql = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_attempts'"
-        ).fetchone()[0]
-    finally:
-        connection.close()
-
-    assert retained == [("old-task", 1, "initial")]
-    assert "post_tool_fallback_repair" in table_sql
+    assert [tuple(row) for row in retained] == [("old-task", 1, "initial")]
+    assert any(
+        "post_tool_fallback_repair" in (constraint["sqltext"] or "")
+        for constraint in checks
+    )
 
 
 def test_chat_usage_health_and_preferences_contracts_remain_unchanged(

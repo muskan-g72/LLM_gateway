@@ -366,7 +366,9 @@ def test_repair_prompt_is_safe_bounded_and_does_not_mutate_original() -> None:
 
 def _settings(**changes: object) -> Settings:
     values: dict[str, object] = {
-        "database_path": ":memory:",
+        "database_url": (
+            "postgresql+psycopg://unused:unused@127.0.0.1:1/unused"
+        ),
         "groq_api_key": "fake-groq-key",
         "groq_model": "gateway-model",
         "gemini_api_key": "fake-gemini-key",

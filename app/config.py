@@ -11,7 +11,7 @@ def _enabled(name: str, default: str = "0") -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    database_path: str
+    database_url: str
     groq_api_key: str
     groq_model: str
     gemini_api_key: str
@@ -25,9 +25,12 @@ def get_settings() -> Settings:
     timeout = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "30"))
     if timeout <= 0:
         raise ValueError("PROVIDER_TIMEOUT_SECONDS must be positive")
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not database_url:
+        raise ValueError("DATABASE_URL is required")
 
     return Settings(
-        database_path=os.getenv("DATABASE_PATH", "gateway.db"),
+        database_url=database_url,
         groq_api_key=os.getenv("GROQ_API_KEY", "").strip(),
         groq_model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip(),
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),

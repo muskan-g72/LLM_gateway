@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +18,7 @@ from app.providers import ProviderCompletion, ProviderOperationalError
 from app.skills import SkillLoader
 from app.task_executor import TaskExecutor
 from app.workflow_executor import WorkflowExecutor
+from tests.database_helpers import fetch_all, fetch_scalar, table_columns, table_names
 
 
 ProviderEvent = ProviderCompletion | Exception
@@ -180,23 +180,18 @@ def _get_trace(client: TestClient, workflow_id: str, key: str = "vk_open"):
 
 
 def _only_workflow_id(store: GatewayStore) -> str:
-    connection = sqlite3.connect(store.database_path)
-    try:
-        row = connection.execute(
-            "SELECT workflow_id FROM workflow_executions LIMIT 1"
-        ).fetchone()
-    finally:
-        connection.close()
-    assert row is not None
-    return str(row[0])
+    workflow_id = fetch_scalar(
+        store,
+        "SELECT workflow_id FROM workflow_executions LIMIT 1",
+    )
+    assert workflow_id is not None
+    return str(workflow_id)
 
 
 def _usage_event_count(store: GatewayStore) -> int:
-    connection = sqlite3.connect(store.database_path)
-    try:
-        return int(connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0])
-    finally:
-        connection.close()
+    count = fetch_scalar(store, "SELECT COUNT(*) FROM usage_events")
+    assert count is not None
+    return int(count)
 
 
 def test_workflow_success_response_and_tool_contract(
@@ -287,18 +282,15 @@ def test_each_workflow_step_retains_its_normal_task_trace(
     _queue_success(provider)
     assert _post(client).status_code == 200
 
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        rows = connection.execute(
-            """
-            SELECT task_id
-            FROM workflow_steps
-            WHERE task_id IS NOT NULL
-            ORDER BY step_order
-            """
-        ).fetchall()
-    finally:
-        connection.close()
+    rows = fetch_all(
+        test_store,
+        """
+        SELECT task_id
+        FROM workflow_steps
+        WHERE task_id IS NOT NULL
+        ORDER BY step_order
+        """,
+    )
 
     traces = [
         client.get(
@@ -582,17 +574,12 @@ def test_workflow_tables_store_no_input_output_prompt_or_credentials(
         },
     ).status_code == 200
 
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        columns = {
-            row[1]
-            for table in ("workflow_executions", "workflow_steps")
-            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
-        }
-        values = connection.execute("SELECT * FROM workflow_executions").fetchall()
-        step_values = connection.execute("SELECT * FROM workflow_steps").fetchall()
-    finally:
-        connection.close()
+    columns = table_columns(test_store, "workflow_executions") | table_columns(
+        test_store,
+        "workflow_steps",
+    )
+    values = fetch_all(test_store, "SELECT * FROM workflow_executions")
+    step_values = fetch_all(test_store, "SELECT * FROM workflow_steps")
 
     assert {
         "input",
@@ -611,22 +598,7 @@ def test_workflow_schema_initialization_is_idempotent(
     test_store: GatewayStore,
 ) -> None:
     test_store.initialize()
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        tables = {
-            row[0]
-            for row in connection.execute(
-                """
-                SELECT name FROM sqlite_master
-                WHERE type = 'table'
-                  AND name IN ('workflow_executions', 'workflow_steps')
-                """
-            ).fetchall()
-        }
-    finally:
-        connection.close()
-
-    assert tables == {"workflow_executions", "workflow_steps"}
+    assert {"workflow_executions", "workflow_steps"} <= table_names(test_store)
 
 
 def test_trace_creation_failure_releases_before_provider_work(
@@ -637,7 +609,7 @@ def test_trace_creation_failure_releases_before_provider_work(
     client, provider = workflow_api
 
     def fail_create(*args: object, **kwargs: object) -> None:
-        raise sqlite3.OperationalError("PRIVATE DATABASE PATH")
+        raise RuntimeError("PRIVATE DATABASE PATH")
 
     monkeypatch.setattr(test_store, "create_workflow_execution", fail_create)
 
@@ -661,7 +633,7 @@ def test_atomic_settlement_failure_never_marks_workflow_completed(
     original = test_store.settle_workflow
 
     def fail_settlement(*args: object, **kwargs: object) -> None:
-        raise sqlite3.OperationalError("PRIVATE SQL")
+        raise RuntimeError("PRIVATE SQL")
 
     monkeypatch.setattr(test_store, "settle_workflow", fail_settlement)
     response = _post(client)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from collections import defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +23,7 @@ from app.prompt_builder import PromptBuilder
 from app.providers import ProviderCompletion
 from app.skills import SkillLoader
 from app.task_executor import TaskExecutor
+from tests.database_helpers import fetch_all
 
 
 class PreferenceProviderGateway:
@@ -363,7 +363,7 @@ def test_database_failure_returns_safe_preference_error(
     client, _ = preference_api
 
     def fail_lookup(owner: str) -> dict[str, str]:
-        raise sqlite3.OperationalError("C:\\private\\gateway.db SQL SELECT")
+        raise RuntimeError("C:\\private\\gateway.db SQL SELECT")
 
     monkeypatch.setattr(test_store, "get_preference_values", fail_lookup)
 
@@ -458,7 +458,7 @@ def test_preference_lookup_failure_happens_before_reservation(
     client, provider = preference_api
 
     def fail_lookup(owner: str) -> dict[str, str]:
-        raise sqlite3.OperationalError("controlled")
+        raise RuntimeError("controlled")
 
     monkeypatch.setattr(test_store, "get_preference_values", fail_lookup)
 
@@ -509,14 +509,11 @@ def test_new_tables_never_store_plaintext_virtual_keys(
     provider.queue("groq", _completion())
     _post_task(client)
 
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        owners = connection.execute(
-            "SELECT virtual_key_id FROM user_preferences UNION ALL "
-            "SELECT virtual_key_id FROM task_executions"
-        ).fetchall()
-    finally:
-        connection.close()
+    owners = fetch_all(
+        test_store,
+        "SELECT virtual_key_id FROM user_preferences UNION ALL "
+        "SELECT virtual_key_id FROM task_executions",
+    )
 
     assert owners
     assert all(owner[0] == virtual_key_identifier("vk_open") for owner in owners)

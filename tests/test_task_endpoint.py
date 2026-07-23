@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +22,7 @@ from app.providers import (
 )
 from app.skills import SkillLoader
 from app.task_executor import TaskExecutor
+from tests.database_helpers import fetch_scalar
 
 
 ProviderEvent = ProviderCompletion | Exception
@@ -130,13 +130,9 @@ def _post_task(
 
 
 def _usage_event_count(store: GatewayStore) -> int:
-    connection = sqlite3.connect(store.database_path)
-    try:
-        row = connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()
-    finally:
-        connection.close()
-    assert row is not None
-    return int(row[0])
+    count = fetch_scalar(store, "SELECT COUNT(*) FROM usage_events")
+    assert count is not None
+    return int(count)
 
 
 def test_valid_summarize_endpoint_contract(
@@ -526,7 +522,7 @@ def test_accounting_failure_returns_safe_500_and_keeps_billable_reservation(
         key: str,
         events: list[tuple[str, int, int]],
     ) -> None:
-        raise sqlite3.OperationalError("controlled accounting failure")
+        raise RuntimeError("controlled accounting failure")
 
     monkeypatch.setattr(test_store, "record_usage_events", fail_accounting)
 

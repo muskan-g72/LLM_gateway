@@ -45,7 +45,7 @@ from app.workflows import (
 
 
 settings = get_settings()
-store = GatewayStore(settings.database_path)
+store = GatewayStore(settings.database_url)
 providers = ProviderGateway(settings)
 task_executor = TaskExecutor(
     SkillLoader(),

@@ -24,7 +24,7 @@ def _chat_payload(model: str = "client-selected-model") -> dict[str, object]:
 
 def _settings() -> Settings:
     return Settings(
-        database_path=":memory:",
+        database_url="postgresql+psycopg://unused:unused@127.0.0.1:1/unused",
         groq_api_key="fake-groq-key",
         groq_model="gateway-owned-groq-model",
         gemini_api_key="fake-gemini-key",

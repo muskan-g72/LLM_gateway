@@ -7,11 +7,12 @@ WORKDIR /service
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && useradd --create-home --uid 10001 gateway \
-    && mkdir -p /data \
-    && chown gateway:gateway /data
+    && useradd --create-home --uid 10001 gateway
 
 COPY --chown=gateway:gateway app ./app
+COPY --chown=gateway:gateway skills ./skills
+COPY --chown=gateway:gateway alembic ./alembic
+COPY --chown=gateway:gateway alembic.ini ./
 
 USER gateway
 EXPOSE 8000

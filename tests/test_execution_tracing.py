@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from collections import defaultdict, deque
 from collections.abc import Iterator
-from pathlib import Path
 from threading import Lock
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import inspect
+from sqlalchemy.exc import IntegrityError
 
 from app import main as main_module
 from app.db import GatewayStore, virtual_key_identifier
@@ -22,6 +22,13 @@ from app.providers import (
 from app.skills import SkillLoader
 from app.task_executor import TaskExecutor
 from app.tracing import ExecutionAttempt
+from tests.database_helpers import (
+    fetch_all,
+    fetch_one,
+    fetch_scalar,
+    table_columns,
+    table_names,
+)
 
 
 ProviderEvent = ProviderCompletion | Exception
@@ -117,39 +124,19 @@ def _get_trace(client: TestClient, task_id: str, key: str = "vk_open"):
     )
 
 
-def _table_columns(store: GatewayStore, table: str) -> set[str]:
-    connection = sqlite3.connect(store.database_path)
-    try:
-        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
-    finally:
-        connection.close()
-    return {str(row[1]) for row in rows}
-
-
-def test_trace_schema_initialization_is_idempotent(tmp_path: Path) -> None:
-    store = GatewayStore(str(tmp_path / "idempotent.db"))
+def test_trace_schema_initialization_is_idempotent(store_factory) -> None:
+    store = store_factory()
     store.initialize()
     store.initialize()
 
-    connection = sqlite3.connect(store.database_path)
-    try:
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
-        indexes = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index'"
-            )
-        }
-    finally:
-        connection.close()
-
-    assert {"task_executions", "task_attempts", "user_preferences"} <= tables
-    assert "sqlite_autoindex_task_attempts_1" in indexes
+    assert {"task_executions", "task_attempts", "user_preferences"} <= table_names(
+        store
+    )
+    constraints = {
+        item["name"]
+        for item in inspect(store.engine).get_unique_constraints("task_attempts")
+    }
+    assert "uq_task_attempts_task_number" in constraints
 
 
 def test_successful_task_persists_completed_trace(
@@ -276,13 +263,8 @@ def test_invalid_after_repair_stores_failed_trace(
     )
 
     response = _post_task(client)
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        task_id = connection.execute(
-            "SELECT task_id FROM task_executions"
-        ).fetchone()[0]
-    finally:
-        connection.close()
+    task_id = fetch_scalar(test_store, "SELECT task_id FROM task_executions")
+    assert task_id is not None
     body = _get_trace(client, task_id).json()
 
     assert response.status_code == 502
@@ -323,13 +305,8 @@ def test_provider_failures_store_safe_terminal_categories(
         provider.queue(provider_name, event)
 
     response = _post_task(client)
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        task_id = connection.execute(
-            "SELECT task_id FROM task_executions"
-        ).fetchone()[0]
-    finally:
-        connection.close()
+    task_id = fetch_scalar(test_store, "SELECT task_id FROM task_executions")
+    assert task_id is not None
     body = _get_trace(client, task_id).json()
 
     assert response.status_code in {500, 502}
@@ -347,13 +324,11 @@ def test_running_trace_exists_while_provider_is_active(
     observed: list[tuple[str, int]] = []
 
     def observe() -> None:
-        connection = sqlite3.connect(test_store.database_path)
-        try:
-            row = connection.execute(
-                "SELECT status, attempts FROM task_executions"
-            ).fetchone()
-        finally:
-            connection.close()
+        row = fetch_one(
+            test_store,
+            "SELECT status, attempts FROM task_executions",
+        )
+        assert row is not None
         observed.append((row[0], row[1]))
 
     provider.before_return = observe
@@ -373,7 +348,7 @@ def test_duplicate_attempt_number_is_rejected(test_store: GatewayStore) -> None:
     attempt = ExecutionAttempt(1, "groq", "initial", "completed", 2, 1)
     test_store.append_task_attempt(task_id, attempt)
 
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(IntegrityError):
         test_store.append_task_attempt(task_id, attempt)
 
 
@@ -414,19 +389,13 @@ def test_trace_tables_exclude_prompts_outputs_and_plaintext_keys(
     )
     _post_task(client)
 
-    execution_columns = _table_columns(test_store, "task_executions")
-    attempt_columns = _table_columns(test_store, "task_attempts")
+    execution_columns = table_columns(test_store, "task_executions")
+    attempt_columns = table_columns(test_store, "task_attempts")
     forbidden_columns = {"prompt", "input", "output", "raw_output", "virtual_key"}
     assert forbidden_columns.isdisjoint(execution_columns | attempt_columns)
 
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        execution_values = connection.execute(
-            "SELECT * FROM task_executions"
-        ).fetchall()
-        attempt_values = connection.execute("SELECT * FROM task_attempts").fetchall()
-    finally:
-        connection.close()
+    execution_values = fetch_all(test_store, "SELECT * FROM task_executions")
+    attempt_values = fetch_all(test_store, "SELECT * FROM task_attempts")
     persisted = repr(execution_values) + repr(attempt_values)
     assert raw_secret not in persisted
     assert "vk_open" not in persisted
@@ -461,7 +430,7 @@ def test_trace_creation_failure_releases_before_provider_work(
     client, provider = trace_api
 
     def fail_creation(*args: object) -> None:
-        raise sqlite3.OperationalError("PRIVATE DATABASE PATH")
+        raise RuntimeError("PRIVATE DATABASE PATH")
 
     monkeypatch.setattr(test_store, "create_task_execution", fail_creation)
 
@@ -484,7 +453,7 @@ def test_attempt_recording_failure_stops_and_safely_fails_trace(
     provider.queue("groq", _completion("groq", _summary_json(), 5, 3))
 
     def fail_attempt(*args: object) -> None:
-        raise sqlite3.OperationalError("SQL SECRET")
+        raise RuntimeError("SQL SECRET")
 
     monkeypatch.setattr(test_store, "append_task_attempt", fail_attempt)
 
@@ -496,14 +465,12 @@ def test_attempt_recording_failure_stops_and_safely_fails_trace(
     stats = test_store.get_usage("vk_open")
     assert stats is not None
     assert (stats.requests, stats.tokens_in, stats.tokens_out) == (1, 5, 3)
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        row = connection.execute(
-            "SELECT status, error_category FROM task_executions"
-        ).fetchone()
-    finally:
-        connection.close()
-    assert row == ("failed", "trace_recording")
+    row = fetch_one(
+        test_store,
+        "SELECT status, error_category FROM task_executions",
+    )
+    assert row is not None
+    assert tuple(row) == ("failed", "trace_recording")
 
 
 def test_terminal_accounting_failure_never_marks_trace_completed(
@@ -515,23 +482,15 @@ def test_terminal_accounting_failure_never_marks_trace_completed(
     provider.queue("groq", _completion("groq", _summary_json()))
 
     def fail_finalization(*args: object, **kwargs: object) -> None:
-        raise sqlite3.OperationalError("controlled")
+        raise RuntimeError("controlled")
 
     monkeypatch.setattr(test_store, "record_usage_events", fail_finalization)
 
     response = _post_task(client)
 
     assert response.status_code == 500
-    connection = sqlite3.connect(test_store.database_path)
-    try:
-        status = connection.execute(
-            "SELECT status FROM task_executions"
-        ).fetchone()[0]
-        usage_events = connection.execute(
-            "SELECT COUNT(*) FROM usage_events"
-        ).fetchone()[0]
-    finally:
-        connection.close()
+    status = fetch_scalar(test_store, "SELECT status FROM task_executions")
+    usage_events = fetch_scalar(test_store, "SELECT COUNT(*) FROM usage_events")
     assert status == "running"
     assert usage_events == 0
     stats = test_store.get_usage("vk_open")
