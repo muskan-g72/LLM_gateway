@@ -63,11 +63,13 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="Minimal LLM Gateway",
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None,
+    title="Orchestrix",
+    description="AI execution platform with virtual keys, provider fallback, budget enforcement, and persistent tracing.",
+    version="1.0.0",
     lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 
 
