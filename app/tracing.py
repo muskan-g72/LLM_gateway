@@ -29,6 +29,14 @@ ValidationErrorCategory = Literal[
 ProviderErrorCategory = Literal["operational", "configuration"]
 TraceStatus = Literal["running", "completed", "failed"]
 ToolTraceStatus = Literal["running", "completed", "failed"]
+WorkflowTraceStatus = Literal["running", "completed", "failed"]
+WorkflowStepTraceStatus = Literal[
+    "pending",
+    "running",
+    "completed",
+    "failed",
+    "skipped",
+]
 
 
 @dataclass(frozen=True)
@@ -83,6 +91,58 @@ class StoredTaskTrace:
     completed_at: str | None
     attempt_history: tuple[StoredAttempt, ...]
     tool_history: tuple[StoredToolExecution, ...]
+
+
+@dataclass(frozen=True)
+class WorkflowStepSettlement:
+    """Safe terminal metadata for one deterministic workflow step."""
+
+    step_order: int
+    task_id: str | None
+    status: Literal["completed", "failed"]
+    provider: str | None
+    attempts: int
+    tool_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    error_category: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredWorkflowStep:
+    step_order: int
+    step_id: str
+    name: str
+    skill: str
+    status: WorkflowStepTraceStatus
+    provider: str | None
+    attempts: int
+    tool_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    error_category: str | None
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+
+
+@dataclass(frozen=True)
+class StoredWorkflowTrace:
+    workflow_id: str
+    definition_id: str
+    name: str
+    description: str
+    status: WorkflowTraceStatus
+    step_count: int
+    completed_steps: int
+    attempts: int
+    tool_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    error_category: str | None
+    created_at: str
+    completed_at: str | None
+    steps: tuple[StoredWorkflowStep, ...]
 
 
 class AttemptRecorder(Protocol):

@@ -143,6 +143,23 @@ class TaskToolExecutionError(TaskExecutionError):
         super().__init__("bounded tool execution failed", attempts, completion_usage)
 
 
+def task_error_category(error: TaskExecutionError) -> str:
+    """Return one bounded category suitable for traces and API policy."""
+    if isinstance(error, TaskProviderConfigurationError):
+        return "configuration"
+    if isinstance(error, TaskProvidersUnavailableError):
+        return "operational"
+    if isinstance(error, TaskInvalidOutputError):
+        return "validation"
+    if isinstance(error, TaskTraceRecordingError):
+        return "trace_recording"
+    if isinstance(error, TaskToolExecutionError):
+        return error.category
+    if isinstance(error, TaskInternalError):
+        return "internal"
+    return "execution"
+
+
 @dataclass(frozen=True)
 class _Invocation:
     attempt_number: int

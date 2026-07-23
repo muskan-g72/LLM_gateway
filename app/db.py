@@ -15,9 +15,14 @@ from app.tracing import (
     StoredAttempt,
     StoredTaskTrace,
     StoredToolExecution,
+    StoredWorkflowStep,
+    StoredWorkflowTrace,
     ToolTraceStatus,
     TraceStatus,
     ValidationErrorCategory,
+    WorkflowStepSettlement,
+    WorkflowStepTraceStatus,
+    WorkflowTraceStatus,
 )
 
 
@@ -194,6 +199,75 @@ class GatewayStore:
 
                 CREATE INDEX IF NOT EXISTS idx_task_tools_task
                 ON task_tool_executions (task_id, tool_number);
+
+                CREATE TABLE IF NOT EXISTS workflow_executions (
+                    workflow_id TEXT PRIMARY KEY,
+                    virtual_key_id TEXT NOT NULL,
+                    definition_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('running', 'completed', 'failed')
+                    ),
+                    step_count INTEGER NOT NULL CHECK (step_count > 0),
+                    completed_steps INTEGER NOT NULL DEFAULT 0 CHECK (
+                        completed_steps >= 0 AND completed_steps <= step_count
+                    ),
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    tool_count INTEGER NOT NULL DEFAULT 0 CHECK (tool_count >= 0),
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                        prompt_tokens >= 0
+                    ),
+                    completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                        completion_tokens >= 0
+                    ),
+                    error_category TEXT NULL,
+                    created_at TEXT NOT NULL DEFAULT (
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    completed_at TEXT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS workflow_steps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_id TEXT NOT NULL,
+                    step_order INTEGER NOT NULL CHECK (step_order > 0),
+                    step_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    skill TEXT NOT NULL,
+                    task_id TEXT NULL UNIQUE,
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'pending', 'running', 'completed', 'failed', 'skipped'
+                        )
+                    ),
+                    provider TEXT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    tool_count INTEGER NOT NULL DEFAULT 0 CHECK (tool_count >= 0),
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                        prompt_tokens >= 0
+                    ),
+                    completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                        completion_tokens >= 0
+                    ),
+                    error_category TEXT NULL,
+                    created_at TEXT NOT NULL DEFAULT (
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    started_at TEXT NULL,
+                    completed_at TEXT NULL,
+                    FOREIGN KEY (workflow_id)
+                        REFERENCES workflow_executions(workflow_id),
+                    FOREIGN KEY (task_id) REFERENCES task_executions(task_id),
+                    UNIQUE (workflow_id, step_order),
+                    UNIQUE (workflow_id, step_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_workflow_executions_owner
+                ON workflow_executions (virtual_key_id, workflow_id);
+
+                CREATE INDEX IF NOT EXISTS idx_workflow_steps_execution
+                ON workflow_steps (workflow_id, step_order);
                 """
             )
             self._upgrade_task_attempt_schema(connection)
@@ -678,6 +752,357 @@ class GatewayStore:
             completed_at=row["completed_at"],
             attempt_history=attempts,
             tool_history=tools,
+        )
+
+    def create_workflow_execution(
+        self,
+        workflow_id: str,
+        virtual_key_id: str,
+        definition_id: str,
+        name: str,
+        description: str,
+        steps: Sequence[tuple[int, str, str, str]],
+    ) -> None:
+        """Create one running workflow and all fixed pending steps atomically."""
+        if not steps:
+            raise ValueError("workflow must contain at least one step")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO workflow_executions (
+                    workflow_id, virtual_key_id, definition_id, name,
+                    description, status, step_count
+                )
+                VALUES (?, ?, ?, ?, ?, 'running', ?)
+                """,
+                (
+                    workflow_id,
+                    virtual_key_id,
+                    definition_id,
+                    name,
+                    description,
+                    len(steps),
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO workflow_steps (
+                    workflow_id, step_order, step_id, name, skill, status
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending')
+                """,
+                [
+                    (
+                        workflow_id,
+                        step_order,
+                        step_id,
+                        step_name,
+                        skill,
+                    )
+                    for step_order, step_id, step_name, skill in steps
+                ],
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def start_workflow_step(
+        self,
+        workflow_id: str,
+        step_order: int,
+        task_id: str,
+        skill: str,
+    ) -> None:
+        """Atomically mark one declared step running and create its task trace."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT workflow_executions.virtual_key_id
+                FROM workflow_executions
+                JOIN workflow_steps
+                  ON workflow_steps.workflow_id = workflow_executions.workflow_id
+                WHERE workflow_executions.workflow_id = ?
+                  AND workflow_executions.status = 'running'
+                  AND workflow_steps.step_order = ?
+                  AND workflow_steps.skill = ?
+                  AND workflow_steps.status = 'pending'
+                """,
+                (workflow_id, step_order, skill),
+            ).fetchone()
+            if row is None:
+                raise sqlite3.IntegrityError("workflow is not running")
+
+            connection.execute(
+                """
+                INSERT INTO task_executions (
+                    task_id, virtual_key_id, skill, status
+                )
+                VALUES (?, ?, ?, 'running')
+                """,
+                (task_id, row["virtual_key_id"], skill),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE workflow_steps
+                SET status = 'running', task_id = ?,
+                    started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE workflow_id = ? AND step_order = ?
+                  AND skill = ? AND status = 'pending'
+                """,
+                (task_id, workflow_id, step_order, skill),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("workflow step could not be started")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def settle_workflow(
+        self,
+        key: str,
+        workflow_id: str,
+        status: Literal["completed", "failed"],
+        steps: Sequence[WorkflowStepSettlement],
+        events: Sequence[tuple[str, int, int]],
+        error_category: str | None = None,
+    ) -> None:
+        """Atomically settle usage, step task traces, and the workflow trace."""
+        prompt_total = sum(tokens_in for _, tokens_in, _ in events)
+        completion_total = sum(tokens_out for _, _, tokens_out in events)
+        if prompt_total != sum(step.prompt_tokens for step in steps):
+            raise ValueError("workflow prompt usage does not match its steps")
+        if completion_total != sum(step.completion_tokens for step in steps):
+            raise ValueError("workflow completion usage does not match its steps")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            owner_id = virtual_key_identifier(key)
+            workflow_row = connection.execute(
+                """
+                SELECT step_count
+                FROM workflow_executions
+                WHERE workflow_id = ? AND virtual_key_id = ? AND status = 'running'
+                """,
+                (workflow_id, owner_id),
+            ).fetchone()
+            if workflow_row is None:
+                raise sqlite3.IntegrityError("workflow trace could not be finalized")
+
+            if events:
+                connection.execute(
+                    """
+                    UPDATE virtual_keys
+                    SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?
+                    WHERE key = ?
+                    """,
+                    (prompt_total, completion_total, key),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO usage_events (
+                        virtual_key, provider, tokens_in, tokens_out
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (key, provider, tokens_in, tokens_out)
+                        for provider, tokens_in, tokens_out in events
+                    ],
+                )
+
+            for step in steps:
+                cursor = connection.execute(
+                    """
+                    UPDATE workflow_steps
+                    SET status = ?, provider = ?, attempts = ?, tool_count = ?,
+                        prompt_tokens = ?, completion_tokens = ?,
+                        error_category = ?,
+                        completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE workflow_id = ? AND step_order = ?
+                      AND status IN ('pending', 'running')
+                    """,
+                    (
+                        step.status,
+                        step.provider,
+                        step.attempts,
+                        step.tool_count,
+                        step.prompt_tokens,
+                        step.completion_tokens,
+                        step.error_category,
+                        workflow_id,
+                        step.step_order,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise sqlite3.IntegrityError(
+                        "workflow step could not be finalized"
+                    )
+
+                if step.task_id is not None:
+                    task_cursor = connection.execute(
+                        """
+                        UPDATE task_executions
+                        SET status = ?, final_provider = ?, attempts = ?,
+                            prompt_tokens = ?, completion_tokens = ?,
+                            error_category = ?,
+                            completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        WHERE task_id = ? AND virtual_key_id = ?
+                          AND status = 'running'
+                        """,
+                        (
+                            step.status,
+                            step.provider,
+                            step.attempts,
+                            step.prompt_tokens,
+                            step.completion_tokens,
+                            step.error_category,
+                            step.task_id,
+                            owner_id,
+                        ),
+                    )
+                    if task_cursor.rowcount != 1:
+                        raise sqlite3.IntegrityError(
+                            "workflow task trace could not be finalized"
+                        )
+
+            if status == "failed":
+                connection.execute(
+                    """
+                    UPDATE workflow_steps
+                    SET status = 'skipped',
+                        completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE workflow_id = ? AND status = 'pending'
+                    """,
+                    (workflow_id,),
+                )
+
+            attempts = sum(step.attempts for step in steps)
+            tool_count = sum(step.tool_count for step in steps)
+            completed_steps = sum(step.status == "completed" for step in steps)
+            workflow_cursor = connection.execute(
+                """
+                UPDATE workflow_executions
+                SET status = ?, completed_steps = ?, attempts = ?,
+                    tool_count = ?, prompt_tokens = ?, completion_tokens = ?,
+                    error_category = ?,
+                    completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE workflow_id = ? AND virtual_key_id = ? AND status = 'running'
+                """,
+                (
+                    status,
+                    completed_steps,
+                    attempts,
+                    tool_count,
+                    prompt_total,
+                    completion_total,
+                    error_category,
+                    workflow_id,
+                    owner_id,
+                ),
+            )
+            if workflow_cursor.rowcount != 1:
+                raise sqlite3.IntegrityError(
+                    "workflow trace could not be finalized"
+                )
+
+            if not events:
+                connection.execute(
+                    """
+                    UPDATE virtual_keys
+                    SET requests = CASE
+                        WHEN requests > 0 THEN requests - 1 ELSE 0
+                    END
+                    WHERE key = ?
+                    """,
+                    (key,),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_workflow_execution(
+        self,
+        workflow_id: str,
+        virtual_key_id: str,
+    ) -> StoredWorkflowTrace | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT workflow_id, definition_id, name, description, status,
+                       step_count, completed_steps, attempts, tool_count,
+                       prompt_tokens, completion_tokens, error_category,
+                       created_at, completed_at
+                FROM workflow_executions
+                WHERE workflow_id = ? AND virtual_key_id = ?
+                """,
+                (workflow_id, virtual_key_id),
+            ).fetchone()
+            if row is None:
+                return None
+            step_rows = connection.execute(
+                """
+                SELECT step_order, step_id, name, skill, status, provider,
+                       attempts, tool_count, prompt_tokens, completion_tokens,
+                       error_category, created_at, started_at, completed_at
+                FROM workflow_steps
+                WHERE workflow_id = ?
+                ORDER BY step_order ASC
+                """,
+                (workflow_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        steps = tuple(
+            StoredWorkflowStep(
+                step_order=item["step_order"],
+                step_id=item["step_id"],
+                name=item["name"],
+                skill=item["skill"],
+                status=cast(WorkflowStepTraceStatus, item["status"]),
+                provider=item["provider"],
+                attempts=item["attempts"],
+                tool_count=item["tool_count"],
+                prompt_tokens=item["prompt_tokens"],
+                completion_tokens=item["completion_tokens"],
+                error_category=item["error_category"],
+                created_at=item["created_at"],
+                started_at=item["started_at"],
+                completed_at=item["completed_at"],
+            )
+            for item in step_rows
+        )
+        return StoredWorkflowTrace(
+            workflow_id=row["workflow_id"],
+            definition_id=row["definition_id"],
+            name=row["name"],
+            description=row["description"],
+            status=cast(WorkflowTraceStatus, row["status"]),
+            step_count=row["step_count"],
+            completed_steps=row["completed_steps"],
+            attempts=row["attempts"],
+            tool_count=row["tool_count"],
+            prompt_tokens=row["prompt_tokens"],
+            completion_tokens=row["completion_tokens"],
+            error_category=row["error_category"],
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+            steps=steps,
         )
 
     def get_preference_values(self, virtual_key_id: str) -> dict[str, str]:

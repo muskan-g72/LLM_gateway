@@ -24,9 +24,24 @@ from app.task_executor import (
     TaskProvidersUnavailableError,
     TaskToolExecutionError,
     TaskTraceRecordingError,
+    task_error_category,
 )
 from app.tools import ToolError
 from app.tracing import StoreTraceRecorder
+from app.workflow_executor import (
+    StoreWorkflowRecorder,
+    WorkflowExecutionError,
+    WorkflowExecutor,
+    WorkflowMappingExecutionError,
+    WorkflowStepExecutionError,
+    WorkflowStepResult,
+    WorkflowTraceRecordingError,
+)
+from app.workflows import (
+    UnknownWorkflowError,
+    WorkflowDefinitionError,
+    WorkflowInputError,
+)
 
 
 settings = get_settings()
@@ -38,6 +53,7 @@ task_executor = TaskExecutor(
     providers,
     OutputValidator(),
 )
+workflow_executor = WorkflowExecutor(task_executor)
 
 
 @asynccontextmanager
@@ -198,6 +214,75 @@ class PreferencesResponse(BaseModel):
     preferences: dict[str, object]
 
 
+class WorkflowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workflow: str = Field(min_length=1)
+    input: dict[str, object]
+    preferences: dict[str, object] | None = None
+
+    @field_validator("workflow")
+    @classmethod
+    def workflow_must_contain_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("workflow must contain text")
+        return value
+
+
+class WorkflowStepResponse(BaseModel):
+    step_order: int
+    step_id: str
+    name: str
+    skill: str
+    status: Literal["completed"]
+    provider: str
+    attempts: int
+    tool_count: int
+    usage: TokenUsage
+
+
+class WorkflowResponse(BaseModel):
+    workflow_id: UUID
+    status: Literal["completed"]
+    workflow: str
+    steps: list[WorkflowStepResponse]
+    output: dict[str, object]
+    usage: TokenUsage
+
+
+class WorkflowTraceStepResponse(BaseModel):
+    step_order: int
+    step_id: str
+    name: str
+    skill: str
+    status: Literal["pending", "running", "completed", "failed", "skipped"]
+    provider: str | None
+    attempts: int
+    tool_count: int
+    usage: TokenUsage
+    error_category: str | None
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+
+
+class WorkflowTraceResponse(BaseModel):
+    workflow_id: str
+    workflow: str
+    name: str
+    description: str
+    status: Literal["running", "completed", "failed"]
+    step_count: int
+    completed_steps: int
+    attempts: int
+    tool_count: int
+    usage: TokenUsage
+    error_category: str | None
+    created_at: str
+    completed_at: str | None
+    steps: list[WorkflowTraceStepResponse]
+
+
 def _virtual_key(authorization: str | None) -> str:
     if authorization is None:
         raise HTTPException(status_code=401, detail="missing or unknown virtual key")
@@ -252,19 +337,7 @@ def _usage_event_tuples(
 
 
 def _task_error_category(error: TaskExecutionError) -> str:
-    if isinstance(error, TaskProviderConfigurationError):
-        return "configuration"
-    if isinstance(error, TaskProvidersUnavailableError):
-        return "operational"
-    if isinstance(error, TaskInvalidOutputError):
-        return "validation"
-    if isinstance(error, TaskTraceRecordingError):
-        return "trace_recording"
-    if isinstance(error, TaskToolExecutionError):
-        return error.category
-    if isinstance(error, TaskInternalError):
-        return "internal"
-    return "execution"
+    return task_error_category(error)
 
 
 def _settle_failed_task(
@@ -415,6 +488,229 @@ def execute_task(
             prompt_tokens=result.usage.prompt_tokens,
             completion_tokens=result.usage.completion_tokens,
         ),
+    )
+
+
+def _workflow_step_response(step: WorkflowStepResult) -> WorkflowStepResponse:
+    if step.status != "completed" or step.provider is None:
+        raise RuntimeError("successful workflow contains an incomplete step")
+    return WorkflowStepResponse(
+        step_order=step.step_order,
+        step_id=step.step_id,
+        name=step.name,
+        skill=step.skill,
+        status="completed",
+        provider=step.provider,
+        attempts=step.attempts,
+        tool_count=step.tool_count,
+        usage=TokenUsage(
+            prompt_tokens=step.usage.prompt_tokens,
+            completion_tokens=step.usage.completion_tokens,
+        ),
+    )
+
+
+@app.post("/v1/workflows/execute", response_model=WorkflowResponse)
+def execute_workflow(
+    request: WorkflowRequest,
+    authorization: Annotated[str | None, Header()] = None,
+) -> WorkflowResponse:
+    key = _virtual_key(authorization)
+    if store.get_usage(key) is None:
+        raise HTTPException(status_code=401, detail="missing or unknown virtual key")
+
+    try:
+        workflow_executor.registry.get(request.workflow)
+    except UnknownWorkflowError:
+        raise HTTPException(status_code=404, detail="unknown workflow") from None
+
+    owner_id = virtual_key_identifier(key)
+    preference_service = PreferenceService(store)
+    try:
+        stored_preferences = preference_service.get(owner_id)
+        effective_preferences = preference_service.merge(
+            stored_preferences,
+            request.preferences,
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="preference storage failed") from None
+
+    prompt_preferences: dict[str, object] | None
+    if effective_preferences or request.preferences is not None:
+        prompt_preferences = effective_preferences
+    else:
+        prompt_preferences = None
+
+    try:
+        prepared = workflow_executor.prepare(
+            request.workflow,
+            request.input,
+            prompt_preferences,
+        )
+    except WorkflowInputError:
+        raise HTTPException(status_code=422, detail="invalid workflow input") from None
+    except (WorkflowDefinitionError, ToolError):
+        raise HTTPException(
+            status_code=500,
+            detail="workflow configuration error",
+        ) from None
+
+    reservation = store.reserve_request(key)
+    if reservation == "unknown":
+        raise HTTPException(status_code=401, detail="missing or unknown virtual key")
+    if reservation == "over_budget":
+        raise HTTPException(status_code=429, detail="virtual key budget exhausted")
+
+    workflow_id = str(prepared.workflow_id)
+    try:
+        store.create_workflow_execution(
+            workflow_id,
+            owner_id,
+            prepared.definition.id,
+            prepared.definition.name,
+            prepared.definition.description,
+            [
+                (index, step.step_id, step.name, step.skill)
+                for index, step in enumerate(prepared.definition.steps, start=1)
+            ],
+        )
+    except Exception:
+        try:
+            store.release_request(key)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="workflow tracing failed") from None
+
+    try:
+        result = workflow_executor.execute(
+            prepared,
+            StoreWorkflowRecorder(store, workflow_id),
+        )
+    except WorkflowExecutionError as error:
+        try:
+            store.settle_workflow(
+                key,
+                workflow_id,
+                "failed",
+                [step.settlement() for step in error.steps],
+                _usage_event_tuples(error.completion_usage),
+                error.error_category,
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail="workflow accounting failed",
+            ) from None
+
+        if isinstance(
+            error,
+            (WorkflowTraceRecordingError, WorkflowMappingExecutionError),
+        ) or error.error_category in {
+            "configuration",
+            "internal",
+            "trace_recording",
+        }:
+            raise HTTPException(
+                status_code=500,
+                detail="workflow execution failed",
+            ) from None
+        if isinstance(error, WorkflowStepExecutionError):
+            raise HTTPException(
+                status_code=502,
+                detail="workflow step failed",
+            ) from None
+        raise HTTPException(
+            status_code=500,
+            detail="workflow execution failed",
+        ) from None
+
+    try:
+        store.settle_workflow(
+            key,
+            workflow_id,
+            "completed",
+            [step.settlement() for step in result.steps],
+            _usage_event_tuples(result.completion_usage),
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="workflow accounting failed",
+        ) from None
+
+    return WorkflowResponse(
+        workflow_id=result.workflow_id,
+        status="completed",
+        workflow=result.workflow,
+        steps=[_workflow_step_response(step) for step in result.steps],
+        output=result.output,
+        usage=TokenUsage(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+        ),
+    )
+
+
+@app.get("/v1/workflows/{workflow_id}", response_model=WorkflowTraceResponse)
+def get_workflow_trace(
+    workflow_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> WorkflowTraceResponse:
+    key = _virtual_key(authorization)
+    if store.get_usage(key) is None:
+        raise HTTPException(status_code=401, detail="missing or unknown virtual key")
+
+    try:
+        trace = store.get_workflow_execution(
+            workflow_id,
+            virtual_key_identifier(key),
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="workflow trace lookup failed",
+        ) from None
+    if trace is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+
+    return WorkflowTraceResponse(
+        workflow_id=trace.workflow_id,
+        workflow=trace.definition_id,
+        name=trace.name,
+        description=trace.description,
+        status=trace.status,
+        step_count=trace.step_count,
+        completed_steps=trace.completed_steps,
+        attempts=trace.attempts,
+        tool_count=trace.tool_count,
+        usage=TokenUsage(
+            prompt_tokens=trace.prompt_tokens,
+            completion_tokens=trace.completion_tokens,
+        ),
+        error_category=trace.error_category,
+        created_at=trace.created_at,
+        completed_at=trace.completed_at,
+        steps=[
+            WorkflowTraceStepResponse(
+                step_order=step.step_order,
+                step_id=step.step_id,
+                name=step.name,
+                skill=step.skill,
+                status=step.status,
+                provider=step.provider,
+                attempts=step.attempts,
+                tool_count=step.tool_count,
+                usage=TokenUsage(
+                    prompt_tokens=step.prompt_tokens,
+                    completion_tokens=step.completion_tokens,
+                ),
+                error_category=step.error_category,
+                created_at=step.created_at,
+                started_at=step.started_at,
+                completed_at=step.completed_at,
+            )
+            for step in trace.steps
+        ],
     )
 
 
