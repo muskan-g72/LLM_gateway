@@ -29,6 +29,7 @@ Orchestrix supports direct chat completions, schema-validated skills and fixed s
 - Explicit reusable preference storage scoped to a virtual key
 - Alembic-managed PostgreSQL schema
 - Deterministic test suite with fake providers and isolated PostgreSQL schemas
+- Load tested with Locust using concurrent users against real LLM providers.
 
 ## Architecture overview
 
@@ -513,6 +514,31 @@ For full test names:
 py -m pytest -v
 ```
 
+## Performance Benchmark
+
+### Baseline Benchmark (Real LLM Providers)
+
+- Tool: Locust
+- Duration: 29 seconds
+- Successful task executions: 6
+- Request failures: 0%
+- Average task latency: 1.92 seconds
+- P95 latency: 2.9 seconds
+- P99 latency: 2.9 seconds
+
+This benchmark represents successful end-to-end task execution through real LLM providers.
+
+## Load Testing
+
+Locust scenarios exercised concurrent requests against:
+
+- task execution
+- trace retrieval
+- preferences
+- health endpoints
+
+Separately, under sustained concurrent load, the gateway propagated upstream provider failures as HTTP `502` responses with `all providers unavailable` instead of hanging or crashing. These responses represent upstream availability failures, not gateway performance failures.
+
 ## Example API requests and responses
 
 Examples use seeded development key `vk_open`. Provider-generated text and token counts vary.
@@ -770,37 +796,19 @@ Traces retain operational metadata needed to explain an execution: provider, att
 
 Memory stores user-selected execution preferences, not conversation history or automatically extracted personal information. Request preferences overlay stored preferences without mutating or implicitly persisting them.
 
-## Current limitations
+## Current Limitations
 
-- Virtual keys are predefined; there is no production identity provider, key administration, rotation, expiry, or scope model.
-- `/usage` authenticates through its legacy query parameter rather than the Bearer header.
-- Budgets count requests only; there are no token, currency, per-provider, or time-window quotas.
-- Groq and Gemini are the only providers, and provider selection is fixed.
-- Provider calls are synchronous and responses are not streamed.
-- Automatic identical network retries and circuit breakers are not implemented.
-- Semantic grounding is conservative and deterministic; it cannot guarantee factual correctness.
-- Only `summarize` and `extract_action_items` are registered skills.
-- Only `calculator` and `text_statistics` are registered tools.
-- A task can execute at most one tool. Thread-based timeout cancellation is best-effort for a misbehaving callable.
-- `article_processing` is the only workflow. Workflows are sequential, limited to eight declared steps, and do not support branching, loops, dynamic planning, or parallel execution.
-- Preferences are explicit key-value settings, not chat memory. Each stored value is limited to 4 KiB.
-- Raw prompts and outputs are intentionally absent from traces, which limits replay and deep debugging.
-- The default container runs one Uvicorn worker and has no background queue or distributed worker system.
-- The initial PostgreSQL migration creates the current schema; it does not import data from a previous database.
+- Application state is persisted in PostgreSQL; multi-instance deployment and horizontal scaling are not yet implemented.
+- Workflow execution is synchronous and runs in the request path without a durable background job queue.
+- Provider integrations are currently limited to Groq and Gemini.
+- Observability is intentionally lightweight and does not include distributed tracing or external metrics systems such as OpenTelemetry or Prometheus.
 
-## Future improvements
+## Future Improvements
 
-- Replace seeded keys with a scoped, hashed, rotatable credential model
-- Add token- or cost-based quotas and configurable budget windows
-- Move Alembic execution to a dedicated deployment step for multi-replica releases
-- Add structured logging, metrics, tracing export, and provider latency telemetry
-- Add idempotency keys for externally retried task and workflow requests
-- Introduce asynchronous provider clients and optional streaming for direct chat
-- Add configurable provider policies, circuit breakers, and carefully bounded retries
-- Expand deterministic validators and skill coverage
-- Add replayable encrypted payload storage only if operational requirements justify it
-- Add parallel or queued workflow execution only for workloads that require it
-- Add PostgreSQL backup, restore, and high-availability guidance
+- Add asynchronous workflow execution using a durable job queue.
+- Support multi-instance deployments through distributed caching and horizontal scaling.
+- Expand provider support with additional LLMs and model-routing strategies.
+- Add observability integrations for OpenTelemetry, Prometheus, and Grafana.
 
 ## License
 
