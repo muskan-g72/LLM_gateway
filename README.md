@@ -1,43 +1,22 @@
 # Orchestrix
 
-A production-inspired AI execution platform for deterministic workflows, structured output validation, provider abstraction, bounded tool execution, authenticated usage controls, and persistent execution tracing.
+## Overview
 
-Orchestrix supports direct chat completions, schema-validated skills and fixed sequential workflows while keeping provider credentials, fallback policy, accounting, and orchestration under application control.
+Orchestrix is an AI execution platform for deterministic workflows, structured output validation, provider abstraction, bounded tool execution, authenticated usage controls, and persistent execution tracing.
 
-## Live Demo
+It supports direct chat completions, schema-validated skills, and fixed sequential workflows while keeping provider credentials, fallback policy, accounting, and orchestration under application control.
+
+### Live demo
 
 - **API Base URL:** https://orchestrix-yc6s.onrender.com
-- **Interactive API Docs:** https://orchestrix-yc6s.onrender.com/docs
-- **OpenAPI Specification:** https://orchestrix-yc6s.onrender.com/openapi.json
+- **Swagger UI:** https://orchestrix-yc6s.onrender.com/docs
 - **Health Check:** https://orchestrix-yc6s.onrender.com/healthz
 
-> The application is hosted on Render’s free tier and may take around a minute to wake after inactivity.
+> The application is hosted on Render's free tier and may take around a minute to wake after inactivity.
 
-## Key capabilities
+## Architecture
 
-- Bearer authentication with predefined virtual API keys and request budgets
-- Atomic PostgreSQL budget reservation under concurrent requests
-- Groq as the primary provider with Gemini fallback
-- Gateway-owned provider models; clients cannot select the upstream model
-- Two YAML-defined skills: `summarize` and `extract_action_items`
-- JSON-only model response protocol with Pydantic structural validation
-- Conservative deterministic semantic validation and one bounded repair attempt
-- Typed, allowlisted tools with validated arguments, bounded results, and time limits
-- Two built-in tools: `calculator` and `text_statistics`
-- One deterministic sequential workflow: `article_processing`
-- Persistent task, provider-attempt, tool, workflow, and usage records
-- Explicit reusable preference storage scoped to a virtual key
-- Alembic-managed PostgreSQL schema
-- Deterministic test suite with fake providers and isolated PostgreSQL schemas
-- Load tested with Locust using concurrent users against real LLM providers.
-
-## Architecture overview
-
-The service separates gateway concerns from execution concerns:
-
-- The **gateway layer** owns HTTP contracts, authentication, budgets, provider clients, usage accounting, and persistence.
-- The **task executor** owns skill loading, prompt construction, response parsing, validation, repair, fallback policy, and bounded tool orchestration.
-- The **workflow executor** runs a trusted, predeclared sequence of task steps. It does not generate, reorder, branch, or recursively execute workflows.
+The gateway layer owns HTTP contracts, authentication, budgets, provider clients, usage accounting, and persistence. `TaskExecutor` coordinates skills, prompts, validation, repair, fallback, and bounded tools. `WorkflowExecutor` runs trusted, predeclared task sequences without dynamic planning, branching, or recursion.
 
 ```mermaid
 flowchart LR
@@ -69,60 +48,24 @@ flowchart LR
     Alembic[Alembic migrations] --> PostgreSQL
 ```
 
-Provider and tool calls run outside database transactions. Only short reservation, trace, preference, and settlement operations hold database transactions, avoiding open locks during external network latency or tool execution.
+The implementation uses Python, FastAPI, Pydantic, HTTPX, PostgreSQL, SQLAlchemy, psycopg, Alembic, PyYAML, pytest, Docker, and Uvicorn. It does not depend on an agent framework.
 
-## Technology stack
+## Key Capabilities
 
-| Area | Technology |
-| --- | --- |
-| Language | Python 3.12+ |
-| API | FastAPI, Pydantic |
-| Provider HTTP | HTTPX |
-| Persistence | PostgreSQL 17, SQLAlchemy 2, psycopg 3 |
-| Schema migrations | Alembic |
-| Skill definitions | YAML |
-| Testing | pytest, FastAPI TestClient |
-| Packaging and runtime | Docker, Docker Compose, Uvicorn |
+- Bearer authentication with predefined virtual API keys and request budgets
+- Atomic PostgreSQL budget reservation under concurrent requests
+- Groq as the primary provider with automatic Gemini fallback
+- Gateway-owned provider selection; clients cannot choose the upstream model
+- YAML-defined skills (`summarize`, `extract_action_items`)
+- JSON-only model response protocol with Pydantic validation and bounded repair
+- Typed, allowlisted tools with validated arguments and bounded execution
+- Deterministic sequential workflow execution (`article_processing`)
+- Persistent task, workflow, provider-attempt, tool, and usage records
+- Virtual-key-scoped execution preferences
+- Deterministic tests using fake providers and isolated PostgreSQL schemas
+- Load tested with Locust against real LLM providers
 
-The project does not use LangChain, CrewAI, AutoGen, MCP, a vector database, or an autonomous planning framework.
-
-## Repository structure
-
-```text
-.
-├── alembic/
-│   ├── env.py
-│   └── versions/
-│       └── 0001_initial_postgresql_schema.py
-├── app/
-│   ├── config.py              # Environment-backed application settings
-│   ├── db.py                  # SQLAlchemy/PostgreSQL repository
-│   ├── main.py                # FastAPI models, routes, and HTTP error mapping
-│   ├── memory.py              # Preference validation and merge behavior
-│   ├── migrations.py          # Programmatic Alembic startup integration
-│   ├── output_validation.py   # Response envelope and skill-output validation
-│   ├── prompt_builder.py      # Provider-neutral prompt construction
-│   ├── providers.py           # Groq/Gemini clients and provider errors
-│   ├── skills.py              # Typed skill definitions and safe YAML loading
-│   ├── task_executor.py       # Bounded task orchestration
-│   ├── tools.py               # Typed tool registry and built-in tools
-│   ├── tracing.py             # Safe trace records and recorder interfaces
-│   ├── workflow_executor.py   # Sequential workflow orchestration
-│   └── workflows.py           # Trusted workflow definitions and mappings
-├── skills/
-│   ├── extract_action_items/skill.yaml
-│   └── summarize/skill.yaml
-├── tests/                     # Unit, integration, accounting, and concurrency tests
-├── .env.example
-├── alembic.ini
-├── compose.yaml
-├── Dockerfile
-└── requirements.txt
-```
-
-## Request lifecycle
-
-### Task execution
+## Request Lifecycle
 
 ```mermaid
 flowchart TD
@@ -151,35 +94,19 @@ flowchart TD
     P --> R[Return validated structured output]
 ```
 
-The concrete lifecycle is:
+Requests are authenticated and validated before one budget unit is reserved. Execution then follows bounded repair, fallback, and tool policies; provider attempts are traced, usage is aggregated, and only validated structured output is returned after atomic accounting and trace settlement.
 
-1. Parse `Authorization: Bearer <virtual-key>` and verify that the key exists.
-2. Load a known local skill or workflow definition.
-3. Load preferences for the authenticated owner and overlay request-scoped preferences.
-4. Validate task input and build provider-neutral messages.
-5. Reserve exactly one request-budget unit with a conditional PostgreSQL update.
-6. Create a running execution trace.
-7. Invoke Groq, recording one attempt for every provider call.
-8. Parse the explicit `final` or `tool_call` response envelope.
-9. Validate final output structurally and semantically.
-10. If output is invalid, issue at most one repair request allowed by the skill.
-11. If an operational provider failure occurs, follow the bounded Gemini fallback path.
-12. If a valid, allowed tool call is returned, execute one tool and request a final response.
-13. Aggregate usage from every provider completion that reports token usage.
-14. Atomically persist usage and finalize the trace as `completed` or `failed`.
-15. Return only validated output; raw provider output is never returned by task APIs.
+## Workflow Overview
 
-### Workflow execution
-
-`article_processing` runs three fixed steps:
+`article_processing` executes three fixed steps:
 
 1. Summarize the source text.
-2. Extract action items using the source and validated summary.
+2. Extract action items from the source and validated summary.
 3. Generate a final summary with access to `text_statistics`.
 
-Each step delegates to `TaskExecutor`, so it receives the same validation, repair, fallback, tool, and trace behavior. Steps run sequentially, validated outputs are mapped forward using application-owned mappings, and a failed step prevents later steps from executing.
+Every step reuses the task execution pipeline, including validation, repair, fallback, tools, and tracing. Steps run sequentially, and a failed step prevents later steps from running.
 
-## Database schema overview
+## Database Schema
 
 ```mermaid
 erDiagram
@@ -252,101 +179,37 @@ erDiagram
     }
 ```
 
-| Table | Purpose |
-| --- | --- |
-| `virtual_keys` | Seeded keys, request budgets, admitted request count, and aggregate token totals |
-| `usage_events` | One row for each provider completion with reported usage |
-| `task_executions` | Task status, owner identifier, final provider, aggregate usage, and terminal category |
-| `task_attempts` | Ordered provider invocations, attempt type, usage, and safe error categories |
-| `task_tool_executions` | Tool name, state, duration, and safe failure category |
-| `user_preferences` | Canonical JSON preference values scoped to a pseudonymous owner identifier |
-| `workflow_executions` | Workflow status and aggregate step, attempt, tool, and token totals |
-| `workflow_steps` | Fixed step order, skill, task reference, status, provider, and usage |
-| `alembic_version` | Current database migration revision |
+PostgreSQL stores virtual keys, usage, task and workflow traces, provider attempts, tool executions, and preferences. `GatewayStore` provides the SQLAlchemy persistence boundary; Alembic manages migrations, and application startup verifies the database, applies migrations, and idempotently seeds local-development keys. Sensitive prompts, raw provider responses, credentials, tool arguments, and tool results are not persisted.
 
-Task and workflow ownership uses a stable SHA-256-derived identifier in trace and preference tables. Execution records intentionally exclude prompts, task input, validated output, raw provider responses, tool arguments, tool results, authorization headers, and provider credentials.
+## Authentication
 
-## Authentication and virtual key model
-
-Execution and preference endpoints require:
+Authenticated endpoints require:
 
 ```http
 Authorization: Bearer <virtual-key>
 ```
 
-The application seeds three keys idempotently:
-
-| Virtual key | Request budget |
+| Seeded key | Request budget |
 | --- | ---: |
 | `vk_open` | 50 |
 | `vk_tiny` | 2 |
 | `vk_edge` | 1 |
 
-Budgets count admitted API requests, not tokens or currency. `spend` in the usage response is therefore equal to `requests`.
+Budgets count admitted requests, not tokens or currency.
 
-`GET /usage` retains its existing query-key contract:
+## Provider Architecture
 
-```http
-GET /usage?key=vk_open
-```
+- Provider calls return a normalized `ProviderCompletion` containing content, token usage, and provider name.
+- Groq is the primary provider; Gemini is the fallback.
+- `GROQ_MODEL` and `GEMINI_MODEL` control upstream models; the client's `model` value is not forwarded.
+- Invalid structured output receives at most one repair attempt on the same provider.
+- Operational failures may trigger fallback, while configuration failures stop safely.
+- Repair and fallback do not reserve additional request units.
+- Provider calls are capped at four per task or workflow step.
 
-The current authentication model is intentionally small: keys are predefined, and there are no endpoints for issuing, rotating, revoking, expiring, or scoping keys. JWT authentication is not implemented.
+## Concurrency Guarantees
 
-## Provider abstraction and fallback strategy
-
-`ProviderGateway` normalizes Groq and Gemini responses into:
-
-```python
-ProviderCompletion(
-    content: str,
-    prompt_tokens: int,
-    completion_tokens: int,
-    provider: str,
-)
-```
-
-The client-provided `model` field on `/v1/chat/completions` is accepted for API compatibility but is not forwarded upstream. `GROQ_MODEL` and `GEMINI_MODEL` control provider selection.
-
-Provider failures are divided into:
-
-- **Operational failures:** timeouts, connection failures, HTTP `408`, HTTP `429`, HTTP `5xx`, missing response content, or unusable provider responses.
-- **Configuration failures:** missing credentials, empty model settings, unsupported provider selection, and non-retryable provider rejections.
-
-For structured tasks:
-
-- Valid primary output returns immediately.
-- Invalid output is repaired once on the same provider before any fallback decision.
-- An operational primary failure switches to Gemini.
-- An operational failure during primary repair may switch to Gemini with the original task prompt.
-- A provider configuration failure stops safely instead of being hidden by fallback.
-- Provider calls are capped at four for one task or one workflow step.
-- Repair and fallback do not reserve additional request-budget units.
-
-The direct chat route preserves its simpler behavior: `ProviderGateway.complete()` attempts Groq and then Gemini when the primary raises a provider error.
-
-## PostgreSQL persistence layer
-
-PostgreSQL was chosen for three concrete requirements:
-
-1. Row-level concurrency supports atomic request admission across threads and processes.
-2. Multi-table transactions keep usage and trace settlement consistent.
-3. A pooled client/server database provides a clearer path beyond single-file persistence.
-
-`GatewayStore` preserves a small repository boundary while using SQLAlchemy engines and short-lived sessions. The engine enables connection health checks and bounded pooling; repository methods open, commit or roll back, and close their own sessions.
-
-Application startup:
-
-1. reads `DATABASE_URL`;
-2. applies `alembic upgrade head`;
-3. verifies connectivity;
-4. seeds virtual keys with `ON CONFLICT DO NOTHING`;
-5. fails with a sanitized initialization error if PostgreSQL is unavailable.
-
-Future schema changes belong in Alembic revisions rather than application-maintained `CREATE TABLE` statements.
-
-## Concurrency guarantees
-
-Reservation is implemented as one conditional statement:
+Budget admission uses one conditional PostgreSQL update:
 
 ```sql
 UPDATE virtual_keys
@@ -355,22 +218,16 @@ WHERE key = :key AND requests < budget
 RETURNING key;
 ```
 
-PostgreSQL serializes conflicting updates to the same virtual-key row. After the final unit is consumed, every concurrent waiter re-evaluates `requests < budget` and fails admission. This prevents multiple requests from consuming the same last budget unit without requiring an application-level mutex.
+PostgreSQL serializes conflicting updates to the same virtual-key row. Once the final unit is consumed, concurrent callers re-evaluate the budget condition and cannot overspend it.
 
-Accounting rules are:
+- One admitted chat, task, or workflow consumes one request unit.
+- Repair, fallback, tools, and workflow steps consume no additional request units.
+- Usage from all reported provider completions is aggregated.
+- Final usage and trace settlement are persisted atomically.
 
-- One admitted chat, task, or workflow reserves one request unit.
-- Repair, fallback, workflow steps, and tool execution do not reserve more request units.
-- If no provider returns a billable completion, the reservation is released.
-- Once any provider returns a completion with usage, the request remains charged even if later validation or tool execution fails.
-- Usage from invalid output, repair, fallback, and post-tool completions is aggregated.
-- Final usage recording and terminal trace settlement occur in one transaction.
+## Error Handling
 
-Provider calls and tool execution happen outside transactions because their latency is unbounded relative to a database operation. Holding a transaction open during external work would retain locks, increase contention, and make failure recovery harder. The service instead uses short transactions before and after external work.
-
-## Error handling
-
-Application exceptions are translated into stable HTTP errors without exposing provider bodies, prompts, credentials, database URLs, SQL statements, stack traces, or unrestricted exception messages.
+Errors are mapped to stable HTTP responses without exposing provider bodies, prompts, credentials, database URLs, SQL, or stack traces.
 
 | Status | Typical meaning |
 | ---: | --- |
@@ -379,13 +236,13 @@ Application exceptions are translated into stable HTTP errors without exposing p
 | `422` | Invalid request shape, task input, workflow input, or preference value |
 | `429` | Virtual-key request budget exhausted |
 | `500` | Provider configuration, local configuration, persistence, tracing, or accounting failure |
-| `502` | Providers unavailable, output invalid after bounded repair, tool failure, or workflow-step failure |
+| `502` | Providers unavailable, invalid output after bounded repair, tool failure, or workflow-step failure |
 
-Trace lookup returns `404` for both an unknown ID and an ID owned by another virtual key, avoiding ownership disclosure.
+Trace lookup returns `404` for both unknown and non-owned IDs to avoid disclosing ownership.
 
-## API endpoints
+## API Endpoints
 
-FastAPI exposes interactive API documentation and the generated OpenAPI specification:
+FastAPI exposes:
 
 - Swagger UI: `/docs`
 - OpenAPI specification: `/openapi.json`
@@ -403,116 +260,11 @@ FastAPI exposes interactive API documentation and the generated OpenAPI specific
 | `GET` | `/usage?key={virtual-key}` | Query parameter | Return request, token, budget, spend, and remaining totals |
 | `GET` | `/healthz` | None | Process health check |
 
-## Local development setup
+## API Examples
 
-### Prerequisites
+Detailed request and response examples are available in `docs/API_EXAMPLES.md`.
 
-- Python 3.12 or newer
-- Docker Desktop or another PostgreSQL 17 instance
-- Groq and Gemini credentials for real provider calls
 
-### Windows PowerShell
-
-Create a virtual environment and install dependencies:
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-py -m pip install -r requirements.txt
-Copy-Item .env.example .env
-```
-
-Replace placeholder PostgreSQL values in `.env`, then start only PostgreSQL:
-
-```powershell
-docker compose up -d postgres
-```
-
-For a host-run application, export environment variables in the shell. The `.env` file is read automatically by Docker Compose, not by the Python process:
-
-```powershell
-$env:DATABASE_URL = "postgresql+psycopg://postgres:<password>@localhost:5432/llm_gateway"
-$env:GROQ_API_KEY = "<groq-api-key>"
-$env:GEMINI_API_KEY = "<gemini-api-key>"
-$env:GROQ_MODEL = "openai/gpt-oss-20b"
-$env:GEMINI_MODEL = "gemini-3.1-flash-lite"
-
-py -m alembic upgrade head
-py -m uvicorn app.main:app --reload
-```
-
-The service listens on `http://localhost:8000`.
-
-## Docker setup
-
-Create the environment file and replace all placeholder values:
-
-```powershell
-Copy-Item .env.example .env
-docker compose up --build
-```
-
-Compose starts PostgreSQL first, waits for `pg_isready`, then starts the gateway. The application applies Alembic migrations during startup.
-
-```powershell
-docker compose ps
-docker compose logs -f gateway
-docker compose down
-```
-
-PostgreSQL data is stored in the `postgres-data` named volume. `docker compose down` preserves it; `docker compose down -v` deletes it.
-
-The Compose defaults expose:
-
-- Gateway: `http://localhost:8000`
-- PostgreSQL: `localhost:5432`
-
-## Environment variables
-
-Use [.env.example](.env.example) as the template.
-
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `POSTGRES_USER` | For Compose | None | PostgreSQL bootstrap user |
-| `POSTGRES_PASSWORD` | For Compose | None | PostgreSQL bootstrap password |
-| `POSTGRES_DB` | For Compose | None | PostgreSQL database name |
-| `DATABASE_URL` | Yes | None | SQLAlchemy PostgreSQL URL used by the application and Alembic |
-| `TEST_DATABASE_URL` | For tests | None | Host-reachable PostgreSQL URL used to create isolated test schemas |
-| `GROQ_API_KEY` | For Groq calls | Empty | Primary provider credential |
-| `GROQ_MODEL` | No | `openai/gpt-oss-20b` | Gateway-owned Groq model |
-| `GEMINI_API_KEY` | For Gemini calls | Empty | Fallback provider credential |
-| `GEMINI_MODEL` | No | `gemini-3.1-flash-lite` | Gateway-owned Gemini model |
-| `PROVIDER_TIMEOUT_SECONDS` | No | `30` | Positive HTTP timeout applied to provider calls |
-| `FORCE_PRIMARY_FAIL` | No | `0` | When enabled, injects an operational primary-provider failure |
-| `JWT_SECRET` | No | Unused | Reserved in the template; JWT authentication is not implemented |
-
-Use `postgres` as the database hostname from the gateway container and `localhost` when running the application or tests directly on the host.
-
-Never commit `.env`. It is excluded by `.gitignore` and `.dockerignore`.
-
-## Running tests
-
-The test suite requires a reachable PostgreSQL database. The test database user must be able to create and drop schemas.
-
-```powershell
-docker compose up -d postgres
-
-$env:TEST_DATABASE_URL = "postgresql+psycopg://postgres:<password>@localhost:5432/llm_gateway"
-$env:DATABASE_URL = $env:TEST_DATABASE_URL
-
-py -m alembic upgrade head
-py -m pytest -q
-```
-
-Each database-backed fixture creates a unique PostgreSQL schema, applies Alembic, and removes the schema after the test. Provider clients are replaced with deterministic fakes, and the test suite blocks real provider HTTP calls.
-
-The current suite contains 311 tests covering endpoint contracts, parsing and validation, repair and fallback paths, tools, workflows, ownership, persistence, accounting, and concurrent last-budget-unit admission.
-
-For full test names:
-
-```powershell
-py -m pytest -v
-```
 
 ## Performance Benchmark
 
@@ -526,289 +278,86 @@ py -m pytest -v
 - P95 latency: 2.9 seconds
 - P99 latency: 2.9 seconds
 
-This benchmark represents successful end-to-end task execution through real LLM providers.
+This benchmark measures successful end-to-end task execution through real LLM providers, including authentication, validation, provider execution, tracing, persistence, and usage accounting.
 
-## Load Testing
+Under sustained concurrent load, upstream provider failures were surfaced as `502 all providers unavailable` without hanging or crashing. These responses reflect upstream availability, not gateway throughput.
 
-Locust scenarios exercised concurrent requests against:
+## Design Decisions
 
-- task execution
-- trace retrieval
-- preferences
-- health endpoints
+- **Explicit orchestration:** Typed Python control flow keeps repair, fallback, tool limits, and workflow order auditable without an agent framework.
+- **Trusted definitions:** Skills, workflows, and tools are application-owned; runtime input and model output cross explicit validation boundaries.
+- **Distinct failure policies:** Repair corrects invalid output, retry repeats a technical operation, and fallback switches providers.
+- **Bounded tools:** Only validated, allowlisted, registry-owned callables can execute.
+- **Privacy-conscious traces:** Execution history stores operational metadata without sensitive prompts, raw responses, tool arguments, or tool results.
 
-Separately, under sustained concurrent load, the gateway propagated upstream provider failures as HTTP `502` responses with `all providers unavailable` instead of hanging or crashing. These responses represent upstream availability failures, not gateway performance failures.
+## Local Development
 
-## Example API requests and responses
+### Prerequisites
 
-Examples use seeded development key `vk_open`. Provider-generated text and token counts vary.
+- Python 3.12+
+- Docker Desktop or PostgreSQL 17
+- Groq and Gemini credentials for real provider calls
 
-### Chat completion
+### Setup
 
-```bash
-curl -s http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer vk_open" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "client-contract-value",
-    "messages": [
-      {"role": "user", "content": "Summarize why atomic updates matter."}
-    ]
-  }'
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -m pip install -r requirements.txt
+Copy-Item .env.example .env
+docker compose up -d postgres
+py -m alembic upgrade head
+py -m uvicorn app.main:app --reload
 ```
 
-```json
-{
-  "content": "Atomic updates prevent concurrent requests from overwriting shared state.",
-  "usage": {
-    "prompt_tokens": 18,
-    "completion_tokens": 12
-  }
-}
+### Environment variables
+
+Required:
+
+- `DATABASE_URL`
+- `GROQ_API_KEY`
+- `GEMINI_API_KEY`
+
+Optional:
+
+- `GROQ_MODEL`
+- `GEMINI_MODEL`
+- `PROVIDER_TIMEOUT_SECONDS`
+
+Additional variables are documented in [.env.example](.env.example).
+
+### Tests
+
+```powershell
+py -m pytest -q
 ```
 
-### Execute a skill
+Tests use fake providers and isolated PostgreSQL schemas to ensure deterministic execution.
 
-```bash
-curl -s http://localhost:8000/v1/tasks/execute \
-  -H "Authorization: Bearer vk_open" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "skill": "summarize",
-    "input": {
-      "text": "The team approved the Friday release. Maya will publish release notes by Thursday."
-    },
-    "preferences": {
-      "response_detail": "concise",
-      "preferred_language": "English"
-    }
-  }'
+## Docker Setup
+
+```powershell
+docker compose up --build
+docker compose ps
+docker compose logs -f gateway
+docker compose down
 ```
 
-```json
-{
-  "task_id": "06b89aa7-7b57-4b9c-8942-5ad005444a31",
-  "status": "completed",
-  "skill": "summarize",
-  "output": {
-    "summary": "The Friday release was approved, with release notes due Thursday.",
-    "key_points": [
-      "Maya will publish the release notes by Thursday."
-    ]
-  },
-  "provider": "groq",
-  "attempts": 1,
-  "usage": {
-    "prompt_tokens": 142,
-    "completion_tokens": 35
-  }
-}
-```
-
-### Retrieve task history
-
-```bash
-curl -s http://localhost:8000/v1/tasks/06b89aa7-7b57-4b9c-8942-5ad005444a31 \
-  -H "Authorization: Bearer vk_open"
-```
-
-```json
-{
-  "task_id": "06b89aa7-7b57-4b9c-8942-5ad005444a31",
-  "status": "completed",
-  "skill": "summarize",
-  "provider": "groq",
-  "attempts": 1,
-  "usage": {
-    "prompt_tokens": 142,
-    "completion_tokens": 35
-  },
-  "error_category": null,
-  "created_at": "2026-07-23T10:00:00Z",
-  "completed_at": "2026-07-23T10:00:01Z",
-  "attempt_history": [
-    {
-      "attempt_number": 1,
-      "provider": "groq",
-      "attempt_type": "initial",
-      "status": "completed",
-      "usage": {
-        "prompt_tokens": 142,
-        "completion_tokens": 35
-      },
-      "validation_error_category": null,
-      "provider_error_category": null,
-      "created_at": "2026-07-23T10:00:00Z"
-    }
-  ]
-}
-```
-
-`tool_history` is included when a tool is used and omitted from tool-free traces because the response model excludes default values.
-
-### Store reusable preferences
-
-```bash
-curl -s -X PUT http://localhost:8000/v1/preferences \
-  -H "Authorization: Bearer vk_open" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "preferences": {
-      "response_detail": "concise",
-      "preferred_language": "English",
-      "include_key_points": true
-    }
-  }'
-```
-
-```json
-{
-  "preferences": {
-    "include_key_points": true,
-    "preferred_language": "English",
-    "response_detail": "concise"
-  }
-}
-```
-
-Preference names must match `^[a-z][a-z0-9_]{0,63}$`. Each value must be JSON-compatible, finite, and at most 4 KiB when canonically serialized. Request preferences override stored values for that execution but are not persisted automatically.
-
-### Execute the built-in workflow
-
-```bash
-curl -s http://localhost:8000/v1/workflows/execute \
-  -H "Authorization: Bearer vk_open" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "workflow": "article_processing",
-    "input": {
-      "text": "The release is scheduled for Friday. Maya must publish release notes by Thursday."
-    }
-  }'
-```
-
-```json
-{
-  "workflow_id": "a7aaaf63-7913-4ed3-9d24-97bc07b741d2",
-  "status": "completed",
-  "workflow": "article_processing",
-  "steps": [
-    {
-      "step_order": 1,
-      "step_id": "summary",
-      "name": "Summarize article",
-      "skill": "summarize",
-      "status": "completed",
-      "provider": "groq",
-      "attempts": 1,
-      "tool_count": 0,
-      "usage": {"prompt_tokens": 120, "completion_tokens": 30}
-    },
-    {
-      "step_order": 2,
-      "step_id": "action_items",
-      "name": "Extract action items",
-      "skill": "extract_action_items",
-      "status": "completed",
-      "provider": "groq",
-      "attempts": 1,
-      "tool_count": 0,
-      "usage": {"prompt_tokens": 150, "completion_tokens": 28}
-    },
-    {
-      "step_order": 3,
-      "step_id": "final_report",
-      "name": "Generate statistics-assisted report",
-      "skill": "summarize",
-      "status": "completed",
-      "provider": "groq",
-      "attempts": 2,
-      "tool_count": 1,
-      "usage": {"prompt_tokens": 310, "completion_tokens": 62}
-    }
-  ],
-  "output": {
-    "summary": "The Friday release requires Maya to publish release notes by Thursday.",
-    "key_points": [
-      "Release date: Friday",
-      "Release notes owner: Maya",
-      "Release notes deadline: Thursday"
-    ]
-  },
-  "usage": {
-    "prompt_tokens": 580,
-    "completion_tokens": 120
-  }
-}
-```
-
-Tool use depends on a valid model `tool_call` response and is not guaranteed on every workflow execution.
-
-### Read usage
-
-```bash
-curl -s "http://localhost:8000/usage?key=vk_open"
-```
-
-```json
-{
-  "key": "vk_open",
-  "requests": 2,
-  "tokens_in": 722,
-  "tokens_out": 155,
-  "spend": 2,
-  "budget": 50,
-  "remaining": 48
-}
-```
-
-## Design decisions
-
-### Explicit orchestration instead of an agent framework
-
-Task and workflow control flow is ordinary typed Python. The call limit, repair policy, fallback transitions, tool limit, and workflow order are visible in code and deterministic tests.
-
-### Trusted definitions, untrusted runtime data
-
-Skills are loaded only from a fixed registry of local YAML files. Workflows and tools are application-owned. Task input, preferences, model output, tool arguments, and tool results cross explicit validation boundaries.
-
-### Structural and semantic validation
-
-Pydantic rejects missing, mistyped, and unexpected fields. Additional deterministic checks reject blank values, exact normalized duplicates, and clearly ungrounded results. These checks improve reliability without claiming to prove factual correctness.
-
-### Repair is separate from retry and fallback
-
-- **Repair** asks a provider to correct invalid structured output.
-- **Retry** would repeat an identical failed network operation; automatic network retries are not implemented.
-- **Fallback** switches from Groq to Gemini after an operational failure.
-
-Keeping these concepts separate makes call limits and accounting auditable.
-
-### Bounded tool execution
-
-Only registry-owned callables can execute. Skill-level allowlists restrict availability, Pydantic validates arguments and results, serialized sizes are bounded, and a task can execute at most one tool. There is no `eval`, shell, subprocess, filesystem, or arbitrary HTTP tool.
-
-### Safe execution history
-
-Traces retain operational metadata needed to explain an execution: provider, attempt type, status, token usage, error category, tool name, duration, and timestamps. Sensitive or high-volume payloads are deliberately not persisted.
-
-### Explicit preference memory
-
-Memory stores user-selected execution preferences, not conversation history or automatically extracted personal information. Request preferences overlay stored preferences without mutating or implicitly persisting them.
+The gateway runs on `localhost:8000` and PostgreSQL on `localhost:5432`; PostgreSQL data persists in the `postgres-data` volume.
 
 ## Current Limitations
 
-- Application state is persisted in PostgreSQL; multi-instance deployment and horizontal scaling are not yet implemented.
-- Workflow execution is synchronous and runs in the request path without a durable background job queue.
-- Provider integrations are currently limited to Groq and Gemini.
-- Observability is intentionally lightweight and does not include distributed tracing or external metrics systems such as OpenTelemetry or Prometheus.
+- Authentication uses predefined virtual keys; issuance, rotation, revocation, expiry, scopes, and JWT authentication are not implemented.
+- Workflow execution is synchronous and does not use a durable background queue.
+- Provider support is limited to Groq and Gemini.
+- Observability is lightweight and does not include distributed tracing or Prometheus/OpenTelemetry metrics.
 
 ## Future Improvements
 
-- Add asynchronous workflow execution using a durable job queue.
-- Support multi-instance deployments through distributed caching and horizontal scaling.
-- Expand provider support with additional LLMs and model-routing strategies.
-- Add observability integrations for OpenTelemetry, Prometheus, and Grafana.
+- Add asynchronous execution using a durable job queue.
+- Support horizontal scaling and distributed deployments.
+- Add provider integrations and model-routing strategies.
+- Integrate OpenTelemetry, Prometheus, and Grafana.
 
 ## License
 
